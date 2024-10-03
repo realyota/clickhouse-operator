@@ -21,7 +21,6 @@ This guide provides step-by-step instructions on how to perform the upgrade, foc
   - [Option B: Manually Recreate PVCs](#option-b-manually-recreate-pvcs)
 - [Step 5: Upgrade the ClickHouse Operator](#step-5-upgrade-the-clickhouse-operator)
 - [Step 6: Reconcile the ClickHouseInstallation](#step-6-reconcile-the-clickhouseinstallation)
-- [Additional Notes](#additional-notes)
 
 ---
 
@@ -240,57 +239,54 @@ Modify your ClickHouseInstallation (CHI) manifest to comply with the new operato
 **Updated CHI Manifest Example (`chi-test-051-chk.yaml`):**
 
 ```yaml
-apiVersion: clickhouse.altinity.com/v1
-kind: ClickHouseInstallation
+apiVersion: "clickhouse-keeper.altinity.com/v1"
+kind: "ClickHouseKeeperInstallation"
 metadata:
   name: test-051-chk
-  namespace: default
 spec:
-  taskID: "test"
   defaults:
     templates:
       podTemplate: default
-      dataVolumeClaimTemplate: default
+      volumeClaimTemplate: default
       serviceTemplate: backwards-compatible
   templates:
     podTemplates:
       - name: default
+        metadata:
+          labels:
+            app: test-051-chk
         spec:
           containers:
-            - name: clickhouse
+            - name: clickhouse-keeper
               imagePullPolicy: IfNotPresent
-              image: "clickhouse/clickhouse-server:24.3.5.46"
+              image: "clickhouse/clickhouse-keeper:24.3.5.46"
               volumeMounts:
                 - name: default
-                  mountPath: /var/lib/clickhouse
-    dataVolumeClaimTemplates:
+                  mountPath: /var/lib/clickhouse-keeper/coordination
+    volumeClaimTemplates:
       - name: default
         spec:
+          persistentVolumeReclaimPolicy: Retain
           accessModes:
             - ReadWriteOnce
           resources:
             requests:
               storage: 1Gi
     serviceTemplates:
-      - name: backwards-compatible
+      - name: backwards-compatible # operator 0.24 default service name is test-051-chk
         generateName: "test-051-chk"
         spec:
           ports:
-            - name: http
-              port: 8123
-            - name: tcp
-              port: 9000
+            - name: zk
+              port: 2181
           type: ClusterIP
           clusterIP: None
   configuration:
     clusters:
       - name: single
-        layout:
-          shardsCount: 1
-          replicasCount: 1
     settings:
-      logger:
-        level: "debug"
+      logger/level: "debug"
+      keeper_server/tcp_port: "2181"
 ```
 
 **Apply the updated CHI manifest:**
@@ -300,9 +296,3 @@ kubectl apply -f chi-test-051-chk.yaml
 ```
 
 ---
-
-## Additional Notes
-
-- **Deprecated Fields**: Replace any instances of `volumeClaimTemplate` with `dataVolumeClaimTemplate` or `logVolumeClaimTemplate` as appropriate.
-- **Service Names**: Be aware that service names may change in the new operator version. Adjust your manifests accordingly.
-- **Data Backup**: Always ensure you have a backup of your data before performing upgrades.

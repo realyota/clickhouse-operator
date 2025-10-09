@@ -4,6 +4,8 @@ commonLabels: {}
 # commonAnnotations -- set of annotations that will be applied to all the resources for the operator
 commonAnnotations: {}
 deployment:
+  # deployment.disableAnnotationRefresh -- disable pod annotation and ConfigMap checksum refresh in operator Deployment that trigger pod rollout on configuration changes
+  disableAnnotationRefresh: false
   # look details in `kubectl explain deployment.spec.strategy`
   strategy:
     type: Recreate

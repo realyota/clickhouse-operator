@@ -507,6 +507,8 @@ Another example with selectively described replicas. Note - `replicasCount` spec
 with additional sections, such as:
 1. `generateName`
 
+**Important:** `serviceTemplates[].spec` is not merged with operator defaults; for ClickHouseKeeperInstallation replica host Services (`replicaServiceTemplate`), include `spec.publishNotReadyAddresses: true` when overriding `spec`.
+
 **`generateName`** is used to explicitly specify service name to be created. `generateName` provides the following macro substitutions:
 1. `{chi}` - ClickHouseInstallation name
 2. `{chiID}` - short hashed ClickHouseInstallation name (BEWARE, this is an experimental feature)

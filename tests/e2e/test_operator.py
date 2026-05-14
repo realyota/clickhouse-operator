@@ -2831,6 +2831,9 @@ def test_010023(self):
         },
     )
     with Then(".status.usedTemplates list all templates"):
+        used_templates = kubectl.get("chi", chi)["status"]["usedTemplates"]
+        print(used_templates)
+
         assert kubectl.get_field("chi", chi, ".status.usedTemplates[0].name") == "clickhouse-stable"
         assert kubectl.get_field("chi", chi, ".status.usedTemplates[1].name") == "extension-annotations"
         assert kubectl.get_field("chi", chi, ".status.usedTemplates[2].name") == "grafana-dashboard-user"
@@ -2891,17 +2894,29 @@ def test_010023(self):
     with Then("Trigger CHI update"):
         kubectl.force_chi_reconcile(chi, "apply-templates")
 
-    with Then(".status.usedTemplates has 3 values"):
+    with Then(".status.usedTemplates shows new values"):
+        used_templates = kubectl.get("chi", chi)["status"]["usedTemplates"]
+        print(used_templates)
+
         assert kubectl.get_field("chi", chi, ".status.usedTemplates[0].name") == "clickhouse-stable"
         assert kubectl.get_field("chi", chi, ".status.usedTemplates[1].name") == "extension-annotations"
         assert kubectl.get_field("chi", chi, ".status.usedTemplates[2].name") == "grafana-dashboard-user"
         assert kubectl.get_field("chi", chi, ".status.usedTemplates[3].name") == "selector-test-1"
-        # assert kubectl.get_field("chi", chi, ".status.usedTemplates[3].name") == ""
 
     with Then("Annotation from selector-1 template should be populated"):
         assert kubectl.get_field("pod", f"chi-{chi}-single-0-0-0", ".metadata.annotations.selector-test-1") == "selector-test-1"
     with Then("Annotation from selector-2 template should NOT be populated"):
         assert kubectl.get_field("pod", f"chi-{chi}-single-0-0-0", ".metadata.annotations.selector-test-2") == "<none>"
+
+    with When("Delete all templates and run reconcile"):
+        kubectl.delete_all("chit")
+        assert kubectl.get_count("chit") == 0, error("All CHIT should be deleted")
+
+        kubectl.force_chi_reconcile(chi, "remove-templates")
+
+        with Then("usedTemplates should have been cleaned in the status"):
+            assert kubectl.get_field("chi", chi, ".status.usedTemplates") == "<none>", error("Used templates should be empty")
+
 
     with Finally("I clean up"):
         delete_test_namespace()
@@ -6309,6 +6324,50 @@ def test_010064(self):
             # What we verify is that CH is still connected to keeper at all (non-empty time).
             new_connected_time = clickhouse.query(chi, "SELECT connected_time from system.zookeeper_connection")
             assert new_connected_time != "", error("ClickHouse is not connected to Keeper after rescale")
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+@TestScenario
+@Name("test_010065_0. Test container security context is propagated to Pod")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_010065_0(self):
+    create_shell_namespace_clickhouse_template()
+
+    manifest = "manifests/chi/test-065-security-context.yaml"
+    manifest_data = yaml_manifest.get_manifest_data(util.get_full_path(manifest))
+    chi = manifest_data["metadata"]["name"]
+    expected_container = manifest_data["spec"]["templates"]["podTemplates"][0]["spec"]["containers"][0]
+    expected_security_context = expected_container["securityContext"]
+
+    with Given("CHI with container security context is installed"):
+        kubectl.create_and_check(
+            manifest=manifest,
+            check={
+                "apply_templates": {current().context.clickhouse_template},
+                "object_counts": {"statefulset": 1, "pod": 1, "service": 2},
+                "do_not_delete": 1,
+            },
+        )
+
+    with Then("ClickHouse Pod container should have the requested security context"):
+        pod_spec = kubectl.get_pod_spec(chi)
+        container = pod_spec["containers"][0]
+        assert container["name"] == expected_container["name"], error(f"Pod container {expected_container['name']} not found")
+
+        actual_security_context = container["securityContext"]
+        print(actual_security_context)
+
+        assert actual_security_context["allowPrivilegeEscalation"] == expected_security_context["allowPrivilegeEscalation"], error(
+            "Pod container allowPrivilegeEscalation does not match CHI pod template"
+        )
+        assert actual_security_context["seccompProfile"] == expected_security_context["seccompProfile"], error(
+            "Pod container seccompProfile does not match CHI pod template"
+        )
+        assert set(actual_security_context["capabilities"]["add"]) == set(expected_security_context["capabilities"]["add"]
+        ), error("Pod container added capabilities do not match CHI pod template")
+        assert set(actual_security_context["capabilities"]["drop"]) == set(expected_security_context["capabilities"]["drop"]
+        ), error("Pod container dropped capabilities do not match CHI pod template")
 
     with Finally("I clean up"):
         delete_test_namespace()

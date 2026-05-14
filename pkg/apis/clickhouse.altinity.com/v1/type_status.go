@@ -407,7 +407,6 @@ func prepareOptions(opts types.CopyStatusOptions) types.CopyStatusOptions {
 		opts.Copy.Actions = true
 		opts.Copy.Errors = true
 		opts.Copy.HostsWithTablesCreated = true
-		opts.Copy.UsedTemplates = true
 	}
 
 	if opts.FieldGroupActions {
@@ -611,8 +610,8 @@ func (s *Status) CopyFrom(f *Status, opts types.CopyStatusOptions) {
 				}
 			}
 			if opts.Copy.UsedTemplates {
-				if len(from.UsedTemplates) > len(s.UsedTemplates) {
-					s.UsedTemplates = nil
+				s.UsedTemplates = nil
+				if len(from.UsedTemplates) > 0 {
 					s.UsedTemplates = append(s.UsedTemplates, from.UsedTemplates...)
 				}
 			}

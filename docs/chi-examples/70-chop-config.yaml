@@ -106,6 +106,143 @@ spec:
 
   ################################################
   ##
+  ## Security Section (operator-wide defaults; CHI spec can override per-CR
+  ## via `spec.configuration.clusters[].security`)
+  ##
+  ## Shape is target-scoped: security.<target>.<protocol>.<knob>.
+  ## ClickHouse-client TLS lives under `clickhouse.tls.*`, ZooKeeper /
+  ## Keeper-client TLS under `zookeeper.tls.*`, Kubernetes-client toggles
+  ## under `kubernetes.*`. IPC and FIPS are operator-internal — no CHI override.
+  ##
+  ################################################
+  security:
+    clickhouse:
+      # TLS verification for outbound ClickHouse client connections the operator
+      # makes (schemer, health probes, /metrics scraping helpers).
+      #
+      # Each field below is a TRISTATE: explicit value, empty string (""), or
+      # absent. Empty/absent means "inherit" — for back-compat the operator's
+      # baseline default is still PERMISSIVE (`InsecureSkipVerify=true`, Go-default
+      # TLS version), matching pre-0.27.1 behavior. Set explicit values here to
+      # tighten across every CHI managed by this operator. A CHI may override
+      # per-cluster via `spec.configuration.clusters[].security.clickhouse.tls`.
+      tls:
+        # `verify`: does the client verify the server's certificate chain?
+        #   "Strict" — verify server cert against `rootCA` (or system roots if
+        #              empty). Hostname must match `serverName` (or the dial
+        #              host if `serverName` is empty). MITM-resistant.
+        #   "None"   — skip verification entirely. Connection is encrypted but
+        #              an attacker can intercept transparently. Useful only for
+        #              development/self-signed clusters.
+        #   ""       — preserve legacy behavior: equivalent to "None" today, but
+        #              re-evaluated by the future master switch. Will become
+        #              "Strict" once the FIPS profile is enforced.
+        verify: ""
+        # `minVersion`: minimum negotiated TLS version. Empty uses Go stdlib
+        # default (currently TLS 1.2). FIPS Strict coerces to "1.3".
+        #   "1.2" | "1.3" | ""
+        minVersion: ""
+        # `serverName`: SNI name + name that the server cert must match when
+        # `verify=Strict`. Empty derives it from the dial host (typically the
+        # pod's headless-service FQDN). Set this when the cert is issued to a
+        # different name than the dial address (e.g. a wildcard or service-CN).
+        serverName: ""
+        # `rootCA`: PEM-encoded CA bundle used to validate the server cert when
+        # `verify=Strict`. Accepts raw PEM or base64-wrapped PEM. Empty means
+        # use the system CA roots from the operator pod's trust store.
+        rootCA: ""
+        # `rootCASecretRef`: alternate source — read the PEM CA from a Kubernetes
+        # Secret. The operator resolves it at CHI normalize time and inlines the
+        # value into `rootCA`. Mutually exclusive with the inline `rootCA` above
+        # — setting both aborts the CR with reason RootCAConflict.
+        #
+        # `key` defaulting: when omitted, the operator tries "ca.crt" first
+        # (cert-manager / kubernetes.io/tls convention), then "tls.crt" as a
+        # fallback. Override `key:` for hand-rolled Secrets with custom layouts.
+        #
+        # Namespace: SecretKeySelector has no namespace field. The Secret is
+        # expected in the CHI's namespace (for cluster-level refs) or the
+        # operator's namespace (for CHOP-config-level refs).
+        #
+        # Missing Secret/key aborts the CR with reason RootCASecretUnresolved.
+        # There is no silent fallback to system roots, because empty CA +
+        # Verify=Strict would refuse every dial.
+        rootCASecretRef:
+         name: my-ca-secret
+         key:  ca.crt
+    zookeeper:
+      # TLS knobs for the operator's ZooKeeper / Keeper client. Existing ZK TLS
+      # already loads cert/key/CA + ServerName separately; these knobs add
+      # MinVersion + InsecureSkipVerify control on top of that path.
+      tls:
+        # Same tristate semantics as `clickhouse.tls.verify`, but the ZK baseline
+        # is more conservative: when the existing ZK TLS path is active (cert+key+CA
+        # are wired up), "Strict" is the effective default. Set "None" here to
+        # opt out of cert verification for a development ZK ensemble.
+        verify: ""
+        # Same semantics as `clickhouse.tls.minVersion`. Empty = Go default (1.2).
+        minVersion: ""
+    kubernetes:
+      tls:
+        # `verify`: TLS posture applied as a LOAD-TIME GATE against the kubeconfig.
+        # Unlike clickhouse/zookeeper, the operator does NOT build the kubeconfig
+        # tls.Config — client-go reads TLSClientConfig.Insecure from disk. This
+        # knob only refuses or permits startup based on what the kubeconfig says.
+        #   "Strict" — refuse startup if the kubeconfig has Insecure=true.
+        #   "None"   — explicit opt-in: permit an insecure kubeconfig.
+        #   ""       — preserve current behavior (kubeconfig wins).
+        verify: ""
+        # `minVersion`: floor TLS at this protocol version. Declared here for
+        # shape uniformity and FIPS coercion symmetry, but NOT yet enforced on
+        # the operator's K8s API transport.
+        #   "1.2" | "1.3" | ""
+        minVersion: ""
+    # Operator↔metrics-exporter REST channel (`/chi` on port 8888) hardening.
+    # Plain (default) preserves today's behavior: server binds all interfaces,
+    # no auth. Secure rejects non-loopback callers at the /chi handler AND
+    # requires an X-CHOP-Token bearer-token header on every request. The
+    # operator provisions the token at startup (32 bytes from crypto/rand,
+    # hex-encoded) into a shared Pod-local emptyDir volume mounted into
+    # both containers.
+    ipc:
+      # `mode`: IPC channel posture.
+      #   "Plain"  — default. Server binds all interfaces, no auth required.
+      #   "Secure" — bind loopback only, require X-CHOP-Token on every call.
+      mode: "Plain"
+      # `bindHost`: address the IPC server binds to in Secure mode. Empty
+      # defaults to "127.0.0.1". Ignored in Plain mode (server still binds
+      # all interfaces).
+      bindHost: ""
+      # `tokenPath`: filesystem path to the shared Pod-local token file used
+      # by both containers in Secure mode. Empty defaults to
+      # "/etc/clickhouse-operator-ipc/token". An advanced GitOps/Vault use
+      # case — sourcing the token from a Kubernetes Secret — is supported
+      # via a Deployment volume override (no CRD field). See
+      # docs/security_hardening.md → Externally-managed token (advanced).
+      tokenPath: ""
+    fips:
+      # Strict FIPS mode — operator-wide master switch. When enforced=yes
+      # the operator coerces all knobs above to their Strict positions at
+      # startup (clickhouse.tls.verify=Strict, clickhouse.tls.minVersion=1.3,
+      # zookeeper.tls.verify=Strict, zookeeper.tls.minVersion=1.3,
+      # kubernetes.tls.verify=Strict, kubernetes.tls.minVersion=1.3,
+      # ipc.mode=Secure) and rejects CHIs that cannot be served in a
+      # FIPS-compatible posture (e.g. CHIs referencing plain-text external
+      # ZooKeeper). Independent of the Go runtime FIPS toolchain — when
+      # this operator binary is built with the FIPS-validated Go toolchain
+      # a future enhancement will OR runtime detection with this knob.
+      enforced: "no"
+      images:
+        # Image-policy gate, orthogonal to `enforced`. Permissive (default)
+        # accepts any image; Required refuses CRs whose CH/Keeper images
+        # lack the "fips" tag substring (admission) AND aborts running CRs
+        # whose `SELECT version()` lacks "fips" (post-Ready confirmation).
+        # See docs/security_hardening.md → "FIPS image policy" for the full
+        # policy matrix + detection details + recovery procedure.
+        policy: Permissive
+
+  ################################################
+  ##
   ## Templates Section
   ##
   ################################################

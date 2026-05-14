@@ -16,6 +16,7 @@ package chi
 
 import (
 	"context"
+	"strings"
 
 	core "k8s.io/api/core/v1"
 
@@ -26,6 +27,17 @@ import (
 	a "github.com/altinity/clickhouse-operator/pkg/controller/common/announcer"
 	"github.com/altinity/clickhouse-operator/pkg/model/k8s"
 )
+
+// normalizeTimeAbortReasons enumerates Aborted reasons that cannot recover via
+// pod transitions — the spec itself must be edited. Auto-recovery skips these
+// to avoid metrics churn on pod-Ready flips that would just re-trigger the same
+// normalize-time abort. Reasons match the tags emitted by ReconcileAbortWithReason.
+var normalizeTimeAbortReasons = []string{
+	api.StatusReasonFIPSValidationFailed,
+	api.StatusReasonRootCAConflict,
+	api.StatusReasonRootCASecretUnresolved,
+	api.StatusReasonFIPSImagePolicyViolation,
+}
 
 // recoverAbortedReconcileOnPodReady inspects a pod update event and re-enqueues the parent
 // CHI for reconcile when the pod transitioned NotReady → Ready and the CHI is Aborted.
@@ -77,12 +89,28 @@ func shouldTriggerAutoRecovery(cr *api.ClickHouseInstallation) bool {
 	if cr == nil {
 		return false
 	}
-	if cr.EnsureStatus().GetStatus() != api.StatusAborted {
+	status := cr.EnsureStatus()
+	if status.GetStatus() != api.StatusAborted {
 		return false
 	}
 	// Skip CHIs being deleted.
 	if !cr.GetDeletionTimestamp().IsZero() {
 		return false
+	}
+	// Skip CHIs aborted by normalize-time validation — a pod-Ready flip won't
+	// fix them. The spec must be edited (e.g. relax FIPS, fix the rootCA Secret,
+	// remove the inline-and-ref conflict) and the normal informer update path
+	// will re-enqueue on that spec change.
+	//
+	// Scan the full bounded Errors list (capped at maxErrors=10) rather than just
+	// the latest — a follow-up untagged error (e.g. a reconcile-step warning) can
+	// be prepended after the tagged abort, shifting it out of position [0].
+	for _, err := range status.GetErrors() {
+		for _, reason := range normalizeTimeAbortReasons {
+			if strings.HasPrefix(err, "["+reason+"]") {
+				return false
+			}
+		}
 	}
 	return true
 }

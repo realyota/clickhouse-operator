@@ -26,7 +26,9 @@ import (
 	goch "github.com/mailru/go-clickhouse/v2"
 
 	log "github.com/altinity/clickhouse-operator/pkg/announcer"
+	api "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
 	"github.com/altinity/clickhouse-operator/pkg/util"
+	"github.com/altinity/clickhouse-operator/pkg/util/tlsutil"
 )
 
 // const clickHouseDriverName = "clickhouse"
@@ -115,64 +117,134 @@ func (c *Connection) connect(ctx context.Context) {
 }
 
 func setupTLSBasic() {
-	goch.RegisterTLSConfig(tlsSettings, &tls.Config{
+	// Register a legacy-keyed config so DSNs referencing tlsSettingsLegacy work
+	// out of the box for endpoints that don't set any TLS knob (preserves the
+	// legacy single-registration behavior).
+	goch.RegisterTLSConfig(tlsSettingsLegacy, &tls.Config{
 		InsecureSkipVerify: true,
 	})
 }
 
+// setupTLSAdvanced builds and registers the tls.Config for this connection's
+// endpoint under a content-hash key (EndpointCredentials.TLSConfigKey). Two
+// endpoints with identical security knobs share one registered config; two
+// endpoints with different knobs register under different keys — so concurrent
+// reconciles of differently-configured clusters cannot race.
+//
+// Honors every security knob even when rootCA is empty: a user setting
+// verify=Strict gets a verifying tls.Config that falls back to the system trust
+// store (Go's stdlib semantics for tls.Config{RootCAs: nil}).
+//
+// Verify semantics: empty verify with no other knobs takes the legacy path
+// (InsecureSkipVerify=true, preserves pre-0.27.1 behavior). Empty verify with
+// other knobs (e.g. user set minVersion but not verify) is treated as Strict —
+// users opting into TLS hardening should not silently get InsecureSkipVerify=true.
 func (c *Connection) setupTLSAdvanced() {
-	// Convenience wrapper
+	// Nothing to do for HTTP DSNs.
+	if c.params.scheme != httpsScheme {
+		return
+	}
+
+	verify := c.params.TLSVerify()
+	minVersion := c.params.TLSMinVersion()
+	serverName := c.params.TLSServerName()
 	certString := c.params.rootCA
 
-	if certString == "" {
-		c.l.V(1).F().Info("No rootCA specified, skip TLS setup")
+	// Legacy path: no knobs set at all → the basic registration from setupTLSBasic
+	// already covers this DSN (InsecureSkipVerify=true, default MinVersion).
+	if (verify == "") && (minVersion == "") && (serverName == "") && (certString == "") {
+		c.l.V(1).F().Info("TLS setup: no security knobs set, using legacy registration")
 		return
 	}
 
-	// Cert may be base64-encoded - decode base64
-	certBytes, err := base64.StdEncoding.DecodeString(certString)
-	if err != nil {
-		// No, it is not
-		c.l.V(1).F().Info("CERT is not Base64-encoded err: %v", err)
-		// Treat provided cert string as PEM-encoded
-		certBytes = []byte(certString)
+	insecure := resolveInsecureSkipVerify(verify, minVersion, serverName)
+
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: insecure,
+		MinVersion:         tlsutil.VersionUint16(minVersion),
+	}
+	if serverName != "" {
+		tlsConfig.ServerName = serverName
 	}
 
-	// Cert may be PEM-encoded - decode PEM block
-	block, _ := pem.Decode(certBytes)
-	if block != nil {
-		// Yes, it is
-		c.l.V(1).F().Info("CERT is PEM-encoded")
-		certBytes = block.Bytes
-	} else {
-		// No, it is not
-		c.l.V(1).F().Info("CERT is not PEM-encoded")
-		// Treat cert string as DER-encoded
-		certBytes = []byte(certString)
+	if certString != "" {
+		rootCAs, err := parseRootCAs(certString, c.l)
+		if err != nil {
+			// User supplied a rootCA but it didn't parse. Refuse to register when
+			// verification is on — silently falling through to the system trust
+			// store would be a surprising downgrade. With verify=None the bytes
+			// were going to be ignored anyway, so log and continue.
+			if !insecure {
+				c.l.V(1).F().Error("unparseable rootCA with verifying TLS — refusing to register TLS config for %s: %v",
+					c.params.GetDSNWithHiddenCredentials(), err)
+				return
+			}
+			c.l.V(1).F().Info("unparseable rootCA but verify=None — proceeding without RootCAs: %v", err)
+		} else {
+			tlsConfig.RootCAs = rootCAs
+		}
 	}
 
-	// Parse DER-encoded cert
-	cert, err := x509.ParseCertificate(certBytes)
-	if err != nil {
-		c.l.V(1).F().Error("unable to parse CERT specified in rootCA err: %v", err)
-		return
-	}
-
-	// Certificates pool
-	rootCAs := x509.NewCertPool()
-	rootCAs.AddCert(cert)
-
-	// Setup TLS
-	err = goch.RegisterTLSConfig(tlsSettings, &tls.Config{
-		RootCAs:            rootCAs,
-		InsecureSkipVerify: true, // TODO: Make it configurable
-	})
-	if err != nil {
+	if err := goch.RegisterTLSConfig(c.params.TLSConfigKey(), tlsConfig); err != nil {
 		c.l.V(1).F().Error("unable to register TLS config err: %v", err)
 		return
 	}
 
-	c.l.V(1).F().Info("TLS setup OK - root Cert registered")
+	c.l.V(1).F().Info("TLS setup OK - registered as %q (verify=%s minVersion=%s serverName=%s rootCA=%t)",
+		c.params.TLSConfigKey(), verify, minVersion, serverName, certString != "")
+}
+
+// resolveInsecureSkipVerify is the pure-function form of the InsecureSkipVerify
+// polarity used by setupTLSAdvanced. Exposed as a separate function so its
+// truth table is unit-testable without constructing a Connection.
+//
+// Distinguishes:
+//   - explicit verify=Strict      → secure (false)
+//   - explicit verify=None        → insecure (true) regardless of other knobs
+//   - empty verify + minVersion or serverName set → secure (those knobs are
+//     opt-in to TLS hardening; without this, minVersion=1.3 alone would
+//     silently leave InsecureSkipVerify=true)
+//   - empty verify + nothing else → INSECURE (legacy: pre-0.27.1 rootCA-only
+//     coexisted with InsecureSkipVerify=true; promoting rootCA-only to strict
+//     would break existing CHIs that supply a CA payload for the auth path
+//     without expecting hostname/chain verification). rootCA is not an opt-in
+//     signal here.
+func resolveInsecureSkipVerify(verify api.TLSVerify, minVersion api.TLSMinVersion, serverName string) bool {
+	if verify == api.TLSVerifyNone {
+		return true
+	}
+	hardeningOptIn := (verify == api.TLSVerifyStrict) || (minVersion != "") || (serverName != "")
+	return !hardeningOptIn
+}
+
+// parseRootCAs decodes a rootCA payload (PEM, base64-wrapped PEM, or raw DER)
+// into a populated CertPool. Returns the parsed pool on success; returns a
+// non-nil error describing the parse failure on failure.
+//
+// Decode order: try base64-decode → try PEM-decode on the result → try DER on
+// what remains. Each step has a documented fallback: if base64 fails, treat the
+// original string as already PEM or DER; if PEM fails on base64-decoded bytes,
+// keep those bytes for the DER attempt (do NOT discard them back to the original
+// string — that was a pre-existing bug).
+func parseRootCAs(certString string, l log.Announcer) (*x509.CertPool, error) {
+	certBytes, b64Err := base64.StdEncoding.DecodeString(certString)
+	if b64Err != nil {
+		l.V(1).F().Info("CERT is not Base64-encoded err: %v", b64Err)
+		certBytes = []byte(certString)
+	}
+	if block, _ := pem.Decode(certBytes); block != nil {
+		l.V(1).F().Info("CERT is PEM-encoded")
+		certBytes = block.Bytes
+	} else {
+		l.V(1).F().Info("CERT is not PEM-encoded; trying DER on current bytes")
+	}
+	cert, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		return nil, fmt.Errorf("rootCA parse failed: %w", err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	return pool, nil
 }
 
 // ensureConnected ensures connection is set

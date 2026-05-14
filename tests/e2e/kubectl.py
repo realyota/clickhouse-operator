@@ -107,6 +107,27 @@ def delete_chk(chk, ns=None, wait=True, ok_to_fail=False, shell=None):
     delete_kind("chk", chk, ns=ns, ok_to_fail=ok_to_fail, shell=shell)
 
     if wait:
+        # Canonical watch-driven readiness: kubectl wait --for=delete returns the
+        # instant the apiserver removes the CR from etcd, sidestepping the poll
+        # window in wait_object. If the CHK is already gone this returns OK fast.
+        target_ns = ns if ns is not None else current().context.test_namespace
+        launch(
+            f"wait --for=delete chk/{chk} --timeout=300s",
+            ns=target_ns, ok_to_fail=True, shell=shell,
+        )
+        # Defensive: if the operator pod was killed mid-finalizer-removal (e.g.
+        # because operator runs in the same namespace as the CHK and the
+        # namespace is mid-tear-down), the CHK CR stays stuck with finalizer.
+        # Force-clear so namespace deletion can proceed instead of hanging the
+        # whole suite on a downstream timeout.
+        still_there = get_count("chk", name=chk, ns=ns, shell=shell)
+        if still_there:
+            print(f"WARNING: chk/{chk} still present after wait --for=delete; clearing finalizers")
+            launch(
+                f"patch chk {chk} --type=merge -p '{{\"metadata\":{{\"finalizers\":[]}}}}'",
+                ns=target_ns, ok_to_fail=True, shell=shell,
+            )
+
         # def wait_object(kind, name, names=[], label="", count=1, ns=None, retries=max_retries, backoff=5, shell=None):
         wait_object("chk", chk, count=0, ns=ns, shell=shell)
 
@@ -474,14 +495,31 @@ def wait_field(
     throw_error=True,
     shell=None,
 ):
-    with Then(f"{kind} {name} {field} should be {value}"):
+    # `value` may be a single scalar (str/int/bool) — match by equality — or
+    # a collection (list/tuple/set/frozenset) — match if the field equals ANY
+    # element. The collection form lets callers accept multiple acceptable
+    # states for racy K8s transitions (e.g. ErrImagePull → ImagePullBackOff
+    # within seconds).
+    if isinstance(value, (list, tuple, set, frozenset)):
+        accepted = set(value)
+        if not accepted:
+            raise ValueError("wait_field: collection value must be non-empty")
+        match = lambda v: v in accepted
+        # sort the *string representations* so mixed-type collections (e.g.
+        # ["x", None] or [1, "1"]) don't raise TypeError before polling begins.
+        desc = f"one of {sorted(map(repr, accepted))}"
+    else:
+        match = lambda v: v == value
+        desc = repr(value)
+
+    with Then(f"{kind} {name} {field} should be {desc}"):
         cur_value = get_field(kind, name, field, ns, shell=shell)
         for i in range(1, retries):
-            if cur_value == value:
+            if match(cur_value):
                 break
             retry_sleep(i, backoff, f"Not ready ({cur_value})")
             cur_value = get_field(kind, name, field, ns, shell=shell)
-        assert cur_value == value or throw_error is False, error()
+        assert match(cur_value) or throw_error is False, error()
 
 
 def wait_field_changed(
@@ -789,11 +827,17 @@ def force_reconcile(name, kind, taskID, ns=None, shell=None):
     with Then(f"Trigger {kind} reconcile with taskID:\"{taskID}\""):
         cmd = f'patch {kind} {name} --type=\'json\' --patch=\'[{{"op":"add","path":"/spec/taskID","value":"{taskID}"}}]\''
         launch(cmd, ns=ns, shell=shell)
+        # Wait for the CR to settle on Completed. We do NOT wait for InProgress
+        # first — a taskID-only patch can be processed so fast that the status
+        # field never visibly transitions to InProgress (the CHK reconciler in
+        # particular returns "No reconcile work" when only taskID changed,
+        # which means status stays Completed throughout). The older two-step
+        # wait raced against the fast path and stalled the whole test on the
+        # InProgress poll. The accept-set on the Completed wait below tolerates
+        # either "already Completed" or "InProgress → Completed" transitions.
         if kind == "chi":
-            wait_chi_status(name, "InProgress", ns=ns, shell=shell)
             wait_chi_status(name, "Completed", ns=ns, shell=shell)
         elif kind == "chk":
-            wait_chk_status(name, "InProgress", ns=ns, shell=shell)
             wait_chk_status(name, "Completed", ns=ns, shell=shell)
         else:
-            assert kind == "chi" or kind == "chi"
+            assert kind == "chi" or kind == "chk"

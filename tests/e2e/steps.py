@@ -46,12 +46,20 @@ def create_test_namespace(self, force=False):
 
 @TestStep(Finally)
 def delete_test_namespace(self):
+    # Tolerate a context that never reached the point of setting test_namespace
+    # (e.g. shell creation failed before create_test_namespace ran). Tests that
+    # wrap their body in Python try/finally for retry-safety call this even on
+    # early setup failures, so a missing attribute must not mask the original error.
+    ns = getattr(self.context, "test_namespace", None)
+    if not ns:
+        print("No test_namespace recorded on context; skipping namespace deletion")
+        return
     if settings.no_cleanup:
-        print(f"NO_CLEANUP is set, skipping namespace deletion: {self.context.test_namespace}")
+        print(f"NO_CLEANUP is set, skipping namespace deletion: {ns}")
         return
     shell = get_shell()
     self.context.shell = shell
-    util.delete_namespace(namespace=self.context.test_namespace, delete_chi=True)
+    util.delete_namespace(namespace=ns, delete_chi=True)
     shell.close()
 
 
@@ -143,6 +151,17 @@ def create_shell_namespace_clickhouse_template(self):
 
     with And("I create test namespace"):
         create_test_namespace()
+        # Register namespace cleanup with TestFlows' context.cleanup hook so it
+        # runs in the scenario's __exit__ (inside a `with Finally("I clean up")`
+        # frame TestFlows owns) regardless of how the test body returns —
+        # success, AssertionError, retry, anything. This replaces the leaky
+        # trailing `with Finally(...): delete_test_namespace()` pattern, which
+        # is unreachable on mid-test exception and was the root cause of
+        # leaked namespaces piling up across retried tests (010036, 010023, …).
+        # delete_test_namespace is idempotent (kubectl ok_to_fail=True), so it
+        # safely co-exists with the trailing-Finally blocks already in many
+        # tests until they're cleaned up.
+        current().context.cleanup(delete_test_namespace)
 
     with And(f"Install ClickHouse template {current().context.clickhouse_template}"):
         kubectl.apply(

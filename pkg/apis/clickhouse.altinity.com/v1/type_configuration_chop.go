@@ -829,16 +829,23 @@ type ConfigCRSource struct {
 
 // OperatorConfig specifies operator config
 type OperatorConfig struct {
-	Runtime     OperatorConfigRuntime    `json:"runtime"    yaml:"runtime"`
-	Watch       OperatorConfigWatch      `json:"watch"      yaml:"watch"`
-	ClickHouse  OperatorConfigClickHouse `json:"clickhouse" yaml:"clickhouse"`
-	Keeper      OperatorConfigKeeper     `json:"keeper"     yaml:"keeper"`
-	Template    OperatorConfigTemplate   `json:"template"   yaml:"template"`
-	Reconcile   OperatorConfigReconcile  `json:"reconcile"  yaml:"reconcile"`
-	Annotation  OperatorConfigAnnotation `json:"annotation" yaml:"annotation"`
-	Label       OperatorConfigLabel      `json:"label"      yaml:"label"`
-	Metrics     OperatorConfigMetrics    `json:"metrics"    yaml:"metrics"`
-	Status      OperatorConfigStatus     `json:"status"     yaml:"status"`
+	Runtime    OperatorConfigRuntime    `json:"runtime"    yaml:"runtime"`
+	Watch      OperatorConfigWatch      `json:"watch"      yaml:"watch"`
+	ClickHouse OperatorConfigClickHouse `json:"clickhouse" yaml:"clickhouse"`
+	Keeper     OperatorConfigKeeper     `json:"keeper"     yaml:"keeper"`
+	Template   OperatorConfigTemplate   `json:"template"   yaml:"template"`
+	Reconcile  OperatorConfigReconcile  `json:"reconcile"  yaml:"reconcile"`
+	Annotation OperatorConfigAnnotation `json:"annotation" yaml:"annotation"`
+	Label      OperatorConfigLabel      `json:"label"      yaml:"label"`
+	Metrics    OperatorConfigMetrics    `json:"metrics"    yaml:"metrics"`
+	Status     OperatorConfigStatus     `json:"status"     yaml:"status"`
+	// Security groups operator-wide security toggles: ClickHouse-client TLS,
+	// ZooKeeper-client TLS, Kubernetes-client reject-insecure, the IPC channel
+	// (operator↔exporter) hardening, and the operator-wide FIPS master switch.
+	// Target-scoped sub-structs (ClickHouse/Zookeeper/Kubernetes) serve as
+	// defaults inherited into CHIs and clusters via MergeFrom (3-level
+	// inheritance); IPC and FIPS are operator-only.
+	Security    OperatorConfigSecurity `json:"security" yaml:"security"`
 	StatefulSet struct {
 		// Revision history limit
 		RevisionHistoryLimit int `json:"revisionHistoryLimit" yaml:"revisionHistoryLimit"`
@@ -1367,6 +1374,147 @@ func (c *OperatorConfig) normalize() {
 	c.normalizeSectionLabel()
 	c.normalizeSectionStatefulSet()
 	c.normalizeSectionPod()
+	// FIPS coercion runs LAST so it overrides any user-specified per-component
+	// values for the knobs it tightens. Field-level overrides are logged.
+	c.applyFIPSStrict()
+}
+
+// applyFIPSStrict coerces the per-component security toggles (CH TLS verify+
+// minVersion, ZK TLS verify+minVersion, K8s TLS verify+minVersion, IPC mode) to their
+// Strict positions when security.fips.enforced is true. Coercion is one-way:
+// each tightened field is logged with its before/after value. No-op when
+// FIPS is not enforced.
+//
+// Runtime FIPS detection (crypto/fips140.Enforced()) is intentionally NOT
+// wired here — that requires the operator binary be built with the FIPS-
+// validated Go toolchain (GOFIPS140=v1.0.0), which is a separate track. Once
+// that ships, this function should OR runtime + config and coerce on either.
+func (c *OperatorConfig) applyFIPSStrict() {
+	if !c.Security.GetFIPS().IsEnforced() {
+		return
+	}
+	s := &c.Security
+	if s.ClickHouse == nil {
+		s.ClickHouse = &ClusterSecurityClickHouse{}
+	}
+	if s.ClickHouse.TLS == nil {
+		s.ClickHouse.TLS = &ClusterSecurityClickHouseTLS{}
+	}
+	coerceClickHouseTLSVerify(s.ClickHouse.TLS, TLSVerifyStrict, "security.clickhouse.tls.verify")
+	coerceClickHouseTLSMinVersion(s.ClickHouse.TLS, TLSMinVersion13, "security.clickhouse.tls.minVersion")
+	if s.Zookeeper == nil {
+		s.Zookeeper = &ClusterSecurityZookeeper{}
+	}
+	if s.Zookeeper.TLS == nil {
+		s.Zookeeper.TLS = &ClusterSecurityZookeeperTLS{}
+	}
+	coerceZookeeperTLSVerify(s.Zookeeper.TLS, TLSVerifyStrict, "security.zookeeper.tls.verify")
+	coerceZookeeperTLSMinVersion(s.Zookeeper.TLS, TLSMinVersion13, "security.zookeeper.tls.minVersion")
+	if s.Kubernetes == nil {
+		s.Kubernetes = &ClusterSecurityKubernetes{}
+	}
+	if s.Kubernetes.TLS == nil {
+		s.Kubernetes.TLS = &ClusterSecurityKubernetesTLS{}
+	}
+	coerceKubernetesTLSVerify(s.Kubernetes.TLS, TLSVerifyStrict, "security.kubernetes.tls.verify")
+	coerceKubernetesTLSMinVersion(s.Kubernetes.TLS, TLSMinVersion13, "security.kubernetes.tls.minVersion")
+	if s.IPC == nil {
+		s.IPC = &OperatorConfigSecurityIPC{}
+	}
+	coerceIPCMode(s.IPC, IPCModeSecure, "security.ipc.mode")
+}
+
+// IsZero reports whether the Security struct has any populated sub-block.
+func (s *OperatorConfigSecurity) IsZero() bool {
+	if s == nil {
+		return true
+	}
+	return (s.ClickHouse == nil) && (s.Zookeeper == nil) && (s.Kubernetes == nil) && (s.IPC == nil) && (s.FIPS == nil)
+}
+
+// RequiresStrictK8sTLS reports whether the operator's resolved security posture
+// demands strict TLS verification on the Kubernetes-API client. True when EITHER
+// security.kubernetes.tls.verify is Strict OR security.fips.enforced is true —
+// FIPS one-way coerces verify to Strict, so the policy MUST fire even before
+// applyFIPSStrict has run. Callable on raw file-based config before normalize.
+func (c *OperatorConfig) RequiresStrictK8sTLS() bool {
+	if c == nil {
+		return false
+	}
+	if c.Security.GetKubernetes().GetTLS().GetVerify() == TLSVerifyStrict {
+		return true
+	}
+	return c.Security.GetFIPS().IsEnforced()
+}
+
+func coerceClickHouseTLSVerify(t *ClusterSecurityClickHouseTLS, target TLSVerify, path string) {
+	prev := t.GetVerify()
+	if prev == target {
+		return
+	}
+	t.Verify = types.NewString(string(target))
+	logFIPSCoercion(path, string(prev), string(target))
+}
+
+func coerceClickHouseTLSMinVersion(t *ClusterSecurityClickHouseTLS, target TLSMinVersion, path string) {
+	prev := t.GetMinVersion()
+	if prev == target {
+		return
+	}
+	t.MinVersion = types.NewString(string(target))
+	logFIPSCoercion(path, string(prev), string(target))
+}
+
+func coerceZookeeperTLSVerify(z *ClusterSecurityZookeeperTLS, target TLSVerify, path string) {
+	prev := z.GetVerify()
+	if prev == target {
+		return
+	}
+	z.Verify = types.NewString(string(target))
+	logFIPSCoercion(path, string(prev), string(target))
+}
+
+func coerceZookeeperTLSMinVersion(z *ClusterSecurityZookeeperTLS, target TLSMinVersion, path string) {
+	prev := z.GetMinVersion()
+	if prev == target {
+		return
+	}
+	z.MinVersion = types.NewString(string(target))
+	logFIPSCoercion(path, string(prev), string(target))
+}
+
+func coerceKubernetesTLSVerify(t *ClusterSecurityKubernetesTLS, target TLSVerify, path string) {
+	prev := t.GetVerify()
+	if prev == target {
+		return
+	}
+	t.Verify = types.NewString(string(target))
+	logFIPSCoercion(path, string(prev), string(target))
+}
+
+func coerceKubernetesTLSMinVersion(t *ClusterSecurityKubernetesTLS, target TLSMinVersion, path string) {
+	prev := t.GetMinVersion()
+	if prev == target {
+		return
+	}
+	t.MinVersion = types.NewString(string(target))
+	logFIPSCoercion(path, string(prev), string(target))
+}
+
+func coerceIPCMode(i *OperatorConfigSecurityIPC, target IPCMode, path string) {
+	prev := i.GetMode()
+	if prev == target {
+		return
+	}
+	i.Mode = types.NewString(string(target))
+	logFIPSCoercion(path, string(prev), string(target))
+}
+
+func logFIPSCoercion(path, before, after string) {
+	if before == "" {
+		before = "(unset)"
+	}
+	log.V(1).Infof("FIPS strict: coerced %s: %s → %s", path, before, after)
 }
 
 // applyEnvVarParams applies ENV VARS over config

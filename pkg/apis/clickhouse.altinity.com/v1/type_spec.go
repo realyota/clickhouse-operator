@@ -33,6 +33,7 @@ type ChiSpec struct {
 	Configuration          *Configuration    `json:"configuration,omitempty"          yaml:"configuration,omitempty"`
 	Templates              *Templates        `json:"templates,omitempty"              yaml:"templates,omitempty"`
 	UseTemplates           []*TemplateRef    `json:"useTemplates,omitempty"           yaml:"useTemplates,omitempty"`
+	Security               *ClusterSecurity  `json:"security,omitempty"               yaml:"security,omitempty"`
 }
 
 // HasTaskID checks whether task id is specified
@@ -107,6 +108,14 @@ func (spec *ChiSpec) GetTemplates() *Templates {
 	return spec.Templates
 }
 
+// GetSecurity returns the spec-level Security block, nil-safe.
+func (spec *ChiSpec) GetSecurity() *ClusterSecurity {
+	if spec == nil {
+		return nil
+	}
+	return spec.Security
+}
+
 // MergeFrom merges from spec
 func (spec *ChiSpec) MergeFrom(from *ChiSpec, _type MergeType) {
 	if from == nil {
@@ -168,4 +177,15 @@ func (spec *ChiSpec) MergeFrom(from *ChiSpec, _type MergeType) {
 	spec.Templates = spec.Templates.MergeFrom(from.Templates, _type)
 	// TODO may be it would be wiser to make more intelligent merge
 	spec.UseTemplates = append(spec.UseTemplates, from.UseTemplates...)
+
+	// Security has no single MergeFrom on the parent struct; merge each sub-block
+	// individually so CHI/CHIT/template overlays preserve user-specified security
+	// knobs. Matches the pattern used by Cluster.InheritClusterSecurityFrom.
+	if fromSecurity := from.GetSecurity(); fromSecurity != nil {
+		if spec.Security == nil {
+			spec.Security = &ClusterSecurity{}
+		}
+		spec.Security.ClickHouse = spec.Security.ClickHouse.MergeFrom(fromSecurity.GetClickHouse(), _type)
+		spec.Security.Zookeeper = spec.Security.Zookeeper.MergeFrom(fromSecurity.GetZookeeper(), _type)
+	}
 }

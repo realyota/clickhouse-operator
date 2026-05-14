@@ -63,6 +63,24 @@ func (w *worker) reconcileCR(ctx context.Context, old, new *apiChk.ClickHouseKee
 
 	new = w.buildCR(ctx, new)
 
+	// If buildCR's normalize already aborted the CR (e.g. FIPS strict rejected
+	// plain-text security bypass), persist the abort and skip reconcile —
+	// otherwise markReconcileStart below would overwrite Status=Aborted with
+	// InProgress. Recovery is via spec edit: informer UpdateFunc re-enqueues
+	// on next apply.
+	if new.EnsureStatus().GetStatus() == api.StatusAborted {
+		w.a.M(new).F().Info("Normalize marked CR Aborted — skipping reconcile (recovery via spec edit)")
+		_ = w.c.updateCRObjectStatus(ctx, new, types.UpdateStatusOptions{
+			CopyStatusOptions: types.CopyStatusOptions{
+				CopyStatusFieldGroup: types.CopyStatusFieldGroup{
+					FieldGroupMain: true,
+				},
+			},
+		})
+		metrics.CRReconcilesAborted(ctx, new)
+		return nil
+	}
+
 	switch {
 	case new.Spec.Suspend.Value():
 		// if CR is suspended, should skip reconciliation

@@ -34,6 +34,17 @@ type ConnectionParams struct {
 	KeyFile  string
 	CaFile   string
 	AuthFile string
+
+	// MinTLSVersion floors the TLS handshake at this protocol version.
+	// "1.2"|"1.3"|"" — empty preserves Go's default (1.2 today). Used only when
+	// TLS is active (CertFile + KeyFile set).
+	MinTLSVersion string
+
+	// InsecureSkipVerify, when true, disables peer-certificate and hostname
+	// verification on the ZK TLS dial. False (default) preserves the existing
+	// strict-verify behavior (the ZK client always provides RootCAs + ServerName).
+	// Set to true only when the cluster's security.zookeeper.verify is None.
+	InsecureSkipVerify bool
 }
 
 func BuildConnectionParams(_params ...*ConnectionParams) *ConnectionParams {

@@ -1,0 +1,9 @@
+apiVersion: "clickhouse.altinity.com/v1"
+kind: "ClickHouseOperatorConfiguration"
+metadata:
+  name: "test-073-fips-strict-chopconf"
+spec:
+  security:
+    fips:
+      # Master switch — coerce per-component knobs + reject plain-text ZK.
+      enforced: "yes"

@@ -33,6 +33,7 @@ import (
 
 	log "github.com/altinity/clickhouse-operator/pkg/announcer"
 	api "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
+	"github.com/altinity/clickhouse-operator/pkg/util/tlsutil"
 )
 
 // Assert that zk.Conn implements ZKClient
@@ -317,9 +318,11 @@ func (c *Connection) connect(servers []string) (ZKClient, <-chan zk.Event, error
 		clientCertPool.AppendCertsFromPEM(clientCACert)
 
 		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			RootCAs:      clientCertPool,
-			ServerName:   serverName,
+			Certificates:       []tls.Certificate{cert},
+			RootCAs:            clientCertPool,
+			ServerName:         serverName,
+			MinVersion:         tlsutil.VersionUint16(api.NewTLSMinVersion(c.MinTLSVersion)),
+			InsecureSkipVerify: c.InsecureSkipVerify,
 		}
 
 		optionsDialer = zk.WithDialer(func(network, address string, timeout time.Duration) (net.Conn, error) {

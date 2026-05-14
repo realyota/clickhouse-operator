@@ -26,6 +26,8 @@ import (
 	log "github.com/altinity/clickhouse-operator/pkg/announcer"
 	api "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
 	"github.com/altinity/clickhouse-operator/pkg/apis/common/types"
+	"github.com/altinity/clickhouse-operator/pkg/apis/swversion"
+	"github.com/altinity/clickhouse-operator/pkg/chop"
 	"github.com/altinity/clickhouse-operator/pkg/controller/chi/metrics"
 	"github.com/altinity/clickhouse-operator/pkg/controller/common"
 	a "github.com/altinity/clickhouse-operator/pkg/controller/common/announcer"
@@ -63,6 +65,23 @@ func (w *worker) reconcileCR(ctx context.Context, old, new *api.ClickHouseInstal
 	startTime := time.Now()
 
 	new = w.buildCR(ctx, new)
+
+	// If buildCR's normalize already aborted the CR (e.g. FIPS strict rejected
+	// plain-text ZooKeeper), persist the abort and skip reconcile — otherwise
+	// markReconcileStart below would overwrite Status=Aborted with InProgress.
+	// Recovery is via spec edit: informer UpdateFunc re-enqueues on next apply.
+	if new.EnsureStatus().GetStatus() == api.StatusAborted {
+		w.a.M(new).F().Info("Normalize marked CR Aborted — skipping reconcile (recovery via spec edit)")
+		_ = w.c.updateCRObjectStatus(ctx, new, types.UpdateStatusOptions{
+			CopyStatusOptions: types.CopyStatusOptions{
+				CopyStatusFieldGroup: types.CopyStatusFieldGroup{
+					FieldGroupMain: true,
+				},
+			},
+		})
+		metrics.CRReconcilesAborted(ctx, new)
+		return nil
+	}
 
 	switch {
 	case new.Spec.Suspend.Value():
@@ -961,6 +980,13 @@ func (w *worker) reconcileHostMain(ctx context.Context, host *api.Host) error {
 		w.a.V(1).
 			M(host).F().
 			Warning("Reconcile Host Main - unable to reconcile domain reconcile. Host: %s Err: %v", host.GetName(), err)
+		// Propagate abort signals (e.g. runtime FIPS image-policy violation) so
+		// reconcile() routes them through markReconcileCompletedUnsuccessfully,
+		// which persists StatusAborted via updateCRObjectStatus. Other errors
+		// stay logged but non-fatal — preserves pre-existing tolerance.
+		if errors.Is(err, common.ErrCRUDAbort) {
+			return err
+		}
 	}
 
 	return nil
@@ -995,7 +1021,10 @@ func (w *worker) reconcileHostMainDomain(ctx context.Context, host *api.Host, mi
 }
 
 func (w *worker) reconcileHostTables(ctx context.Context, host *api.Host, opts *migrateTableOptions) error {
-	if !w.shouldMigrateTables(host, opts) {
+	needMigrate := w.shouldMigrateTables(host, opts)
+	needFIPSCheck := chop.Config().Security.GetFIPS().GetImages().IsRequired()
+
+	if !needMigrate && !needFIPSCheck {
 		w.a.V(1).
 			M(host).F().
 			Info(
@@ -1004,24 +1033,36 @@ func (w *worker) reconcileHostTables(ctx context.Context, host *api.Host, opts *
 		return nil
 	}
 
-	// Need to migrate tables
-
-	// Prepare for tables migration.
-	// Ensure host is running and accessible and what version is available.
-	// Sometimes service needs some time to start after creation|modification before being accessible for usage
-	// However, it is expected to have host up and running at this point
-	version, err := w.pollHostForClickHouseVersion(ctx, host)
-	if err != nil {
+	// Fetch SELECT version() for migration (poll until ready) OR FIPS-only
+	// confirmation (single call; fail-open on err so a dead host doesn't burn
+	// the migrate poll timeout when migration is not needed).
+	var version *swversion.SoftWareVersion
+	if needMigrate {
+		v, err := w.pollHostForClickHouseVersion(ctx, host)
+		if err != nil {
+			w.a.V(1).
+				M(host).F().
+				Warning("Check host for ClickHouse availability. Host: %s Failed to get ClickHouse version. Err: %s", host.GetName(), err)
+			return err
+		}
+		version = v
 		w.a.V(1).
 			M(host).F().
-			Warning("Check host for ClickHouse availability before migrating tables. Host: %s Failed to get ClickHouse version. Err: %s", host.GetName(), err)
+			Info("Check host for ClickHouse availability. Host: %s ClickHouse version available: %s", host.GetName(), version)
+	} else {
+		version = w.getHostClickHouseVersion(ctx, host)
+	}
+
+	// Runtime FIPS image-policy confirmation. Returns common.ErrCRUDAbort
+	// when the CR is aborted; propagating the error routes it through
+	// reconcile()'s abort path which persists status correctly.
+	if err := w.enforceFIPSImagePolicyRuntime(host, version); err != nil {
 		return err
 	}
 
-	w.a.V(1).
-		M(host).F().
-		Info("Check host for ClickHouse availability before migrating tables. Host: %s ClickHouse version available: %s", host.GetName(), version)
-
+	if !needMigrate {
+		return nil
+	}
 	return w.migrateTables(ctx, host, opts)
 }
 

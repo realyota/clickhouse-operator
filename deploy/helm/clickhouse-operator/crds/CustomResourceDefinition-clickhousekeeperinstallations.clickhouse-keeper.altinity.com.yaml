@@ -541,6 +541,13 @@ spec:
                               by specifying 0. This is a mutually exclusive setting with "minAvailable".
                             minimum: 0
                             maximum: 65535
+                          security:
+                            type: object
+                            description: |
+                              Per-cluster security toggles. Nil fields fall through to CHK spec security and
+                              then to operator-wide defaults in ClickHouseOperatorConfiguration. Symmetric
+                              with chi.spec.configuration.clusters[].security. See docs/security_hardening.md.
+                            x-kubernetes-preserve-unknown-fields: true
                           layout:
                             type: object
                             description: |
@@ -627,6 +634,12 @@ spec:
                                             description: |
                                               optional, configuration of the templates names which will use for generate Kubernetes resources according to selected replica
                                               override top-level `chi.spec.configuration.templates`, cluster-level `chi.spec.configuration.clusters.templates`, replica-level `chi.spec.configuration.clusters.layout.replicas.templates`
+                security:
+                  type: object
+                  description: |
+                    CHK-level security defaults, applied to every cluster that does not override
+                    them. Symmetric with chi.spec.security. See docs/security_hardening.md.
+                  x-kubernetes-preserve-unknown-fields: true
                 templates:
                   type: object
                   description: "allows define templates which will use for render Kubernetes resources like StatefulSet, ConfigMap, Service, PVC, by default, clickhouse-operator have own templates, but you can override it"

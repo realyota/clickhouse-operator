@@ -47,7 +47,21 @@ func (w *worker) reconcileClusterZookeeperRootPath(cluster *api.Cluster) error {
 }
 
 func ensureZkPath(cluster *api.Cluster) {
-	conn := zookeeper.NewConnection(cluster.Zookeeper.Nodes)
+	// Plumb cluster-level security.zookeeper.tls.{minVersion,verify} into the
+	// ZK dial. Defaults preserve current behavior (Go default TLS version,
+	// strict verify since RootCAs+ServerName are always set). CHOP-config
+	// defaults reach here via InheritClusterSecurityFrom + normalizeClusterSecurity.
+	zk := cluster.GetSecurity().GetZookeeper().GetTLS()
+	mv := zk.GetMinVersion()
+	verify := zk.GetVerify()
+	var params *zookeeper.ConnectionParams
+	if (mv != "") || (verify == api.TLSVerifyNone) {
+		params = &zookeeper.ConnectionParams{
+			MinTLSVersion:      string(mv),
+			InsecureSkipVerify: verify == api.TLSVerifyNone,
+		}
+	}
+	conn := zookeeper.NewConnection(cluster.Zookeeper.Nodes, params)
 	path := zookeeper.NewPathManager(conn)
 	path.Ensure(cluster.Zookeeper.Root)
 	path.Close()

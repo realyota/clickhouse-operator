@@ -158,17 +158,22 @@ func (w *worker) ensureClusterSchemer(host *api.Host) *schemer.ClusterSchemer {
 	if w == nil {
 		return nil
 	}
-	// Make base cluster connection params
+	// Make base cluster connection params from CHOP-config defaults, then
+	// overlay the per-cluster security.clickhouse.tls fields populated by the
+	// normalizer (3-level inheritance: CHOP-config → CHI → cluster). Without
+	// the overlay the cluster-level Verify/MinVersion/ServerName/RootCA
+	// wouldn't reach the dial — CHOP-config values would silently win.
 	clusterConnectionParams := clickhouse.NewClusterConnectionParamsFromCHOpConfig(chop.Config())
+	clusterConnectionParams.OverlayClusterSecurityTLS(host.GetCluster().GetSecurity().GetClickHouse().GetTLS())
 	// Adjust base cluster connection params with per-host props
 	switch clusterConnectionParams.Scheme {
 	case api.ChSchemeAuto:
 		switch {
 		case host.HTTPPort.HasValue():
-			clusterConnectionParams.Scheme = "http"
+			clusterConnectionParams.Scheme = api.ChSchemeHTTP
 			clusterConnectionParams.Port = host.HTTPPort.IntValue()
 		case host.HTTPSPort.HasValue():
-			clusterConnectionParams.Scheme = "https"
+			clusterConnectionParams.Scheme = api.ChSchemeHTTPS
 			clusterConnectionParams.Port = host.HTTPSPort.IntValue()
 		}
 	case api.ChSchemeHTTP:

@@ -1198,6 +1198,14 @@ spec:
                                     required:
                                       - name
                                       - key
+                          security:
+                            type: object
+                            description: |
+                              Per-cluster security toggles for outbound TLS connections the operator makes
+                              to this cluster's ClickHouse and ZooKeeper / Keeper hosts. Nil fields fall
+                              through to the operator-wide defaults in ClickHouseOperatorConfiguration.
+                              See docs/security_hardening.md for details.
+                            x-kubernetes-preserve-unknown-fields: true
                           pdbManaged:
                             !!merge <<: *TypeStringBool
                             description: |
@@ -1767,6 +1775,13 @@ spec:
                               More info: https://kubernetes.io/docs/concepts/services-networking/service/
                             # nullable: true
                             x-kubernetes-preserve-unknown-fields: true
+                security:
+                  type: object
+                  description: |
+                    CHI-level security defaults, applied to every cluster that does not override
+                    them. Each cluster can shadow these via spec.configuration.clusters[].security.
+                    See docs/security_hardening.md for details.
+                  x-kubernetes-preserve-unknown-fields: true
                 useTemplates:
                   type: array
                   description: |

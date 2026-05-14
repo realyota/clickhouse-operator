@@ -57,6 +57,7 @@ PRELOAD_IMAGES_OPERATOR=(
     "clickhouse/clickhouse-server:latest"
     # Altinity builds (default stable template + FIPS)
     "altinity/clickhouse-server:25.8.16.10001.altinitystable"  # default clickhouse_template
+    "altinity/clickhouse-server:25.8.16.10002.altinitystable"  # test_010035 auto-recovery upgrade target (manifests/chi/test-035-auto-recovery-2.yaml)
     "altinity/clickhouse-server:25.3.8.30001.altinityfips"     # FIPS CHI (e.g. manifests/chk/test-020008-chi-fips.yaml)
     # ClickHouse Keeper versions used in operator tests (test_010063, test_020008, ...)
     "clickhouse/clickhouse-keeper:25.3"
@@ -82,6 +83,7 @@ PRELOAD_IMAGES_KEEPER=(
     "clickhouse/clickhouse-server:latest"
     # Altinity builds
     "altinity/clickhouse-server:25.8.16.10001.altinitystable"  # default clickhouse_template
+    "altinity/clickhouse-server:25.8.16.10002.altinitystable"  # test_010035 auto-recovery upgrade target
     "altinity/clickhouse-server:25.3.8.30001.altinityfips"     # FIPS CHI (manifests/chk/test-020008-chi-fips.yaml)
     # ClickHouse Keeper versions
     "clickhouse/clickhouse-keeper:25.3"

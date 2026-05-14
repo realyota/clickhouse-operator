@@ -28,6 +28,7 @@ type Cluster struct {
 	PDBManaged        *types.StringBool        `json:"pdbManaged,omitempty"        yaml:"pdbManaged,omitempty"`
 	PDBMaxUnavailable *types.Int32             `json:"pdbMaxUnavailable,omitempty" yaml:"pdbMaxUnavailable,omitempty"`
 	Reconcile         *apiChi.ClusterReconcile `json:"reconcile,omitempty"         yaml:"reconcile,omitempty"`
+	Security          *apiChi.ClusterSecurity  `json:"security,omitempty"          yaml:"security,omitempty"`
 	Layout            *ChkClusterLayout        `json:"layout,omitempty"            yaml:"layout,omitempty"`
 
 	Runtime ChkClusterRuntime `json:"-" yaml:"-"`
@@ -125,6 +126,14 @@ func (c *Cluster) GetSecret() *apiChi.ClusterSecret {
 	return nil
 }
 
+// GetSecurity is a getter
+func (c *Cluster) GetSecurity() *apiChi.ClusterSecurity {
+	if c == nil {
+		return nil
+	}
+	return c.Security
+}
+
 // GetPDBManaged is a getter
 func (cluster *Cluster) GetPDBManaged() *types.StringBool {
 	return cluster.PDBManaged
@@ -212,6 +221,25 @@ func (cluster *Cluster) InheritClusterReconcileFrom(chk *ClickHouseKeeperInstall
 	reconcile.Runtime = reconcile.Runtime.MergeFrom(chk.Spec.Reconcile.Runtime, apiChi.MergeTypeFillEmptyValues)
 	reconcile.Host = reconcile.Host.MergeFrom(chk.Spec.Reconcile.Host)
 	cluster.Reconcile = reconcile
+}
+
+// InheritClusterSecurityFrom inherits security knobs from the CHK spec.
+// CHOP-config → CHK spec → cluster; the final fill from CHOP-config happens
+// in normalizeClusterSecurity in the normalizer. Fills only empty fields, so
+// cluster-level overrides win over CHK-spec-level.
+func (cluster *Cluster) InheritClusterSecurityFrom(chk *ClickHouseKeeperInstallation) {
+	if chk == nil {
+		return
+	}
+	specSecurity := chk.GetSpecT().GetSecurity()
+	if specSecurity == nil {
+		return
+	}
+	if cluster.Security == nil {
+		cluster.Security = &apiChi.ClusterSecurity{}
+	}
+	cluster.Security.ClickHouse = cluster.Security.ClickHouse.MergeFrom(specSecurity.GetClickHouse(), apiChi.MergeTypeFillEmptyValues)
+	cluster.Security.Zookeeper = cluster.Security.Zookeeper.MergeFrom(specSecurity.GetZookeeper(), apiChi.MergeTypeFillEmptyValues)
 }
 
 // InheritTemplatesFrom inherits templates from CHI

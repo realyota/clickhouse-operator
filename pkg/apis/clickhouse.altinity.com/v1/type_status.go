@@ -15,6 +15,7 @@
 package v1
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 
@@ -35,6 +36,28 @@ const (
 	StatusCompleted   = "Completed"
 	StatusAborted     = "Aborted"
 	StatusTerminating = "Terminating"
+)
+
+// Status reasons distinguish flavors of StatusAborted. The reason is pushed
+// into the error stream so operators can grep / dashboards can branch on it
+// (existing CR status schema has no first-class Reason field — preserving
+// the schema is the back-compat trade-off).
+const (
+	StatusReasonFIPSValidationFailed = "FIPSValidationFailed"
+	// StatusReasonRootCAConflict: both inline RootCA and RootCASecretRef set on
+	// the same security.tls block. User must pick one.
+	StatusReasonRootCAConflict = "RootCAConflict"
+	// StatusReasonRootCASecretUnresolved: the RootCASecretRef points at a Secret
+	// or key that the operator cannot read. Aborts rather than silently falling
+	// back to system roots — empty CA + Verify=Strict would refuse all dials.
+	StatusReasonRootCASecretUnresolved = "RootCASecretUnresolved"
+	// StatusReasonFIPSImagePolicyViolation: security.fips.images.policy=Required
+	// rejected this CR because a ClickHouse/Keeper container image lacks the
+	// "fips" tag substring (admission gate) or the running binary's
+	// `SELECT version()` reply lacks "fips" (post-Ready gate). Separate from
+	// FIPSValidationFailed so dashboards can distinguish operator-config bypass
+	// from per-CR image-policy violations.
+	StatusReasonFIPSImagePolicyViolation = "FIPSImagePolicyViolation"
 )
 
 // Status defines status section of the custom resource.
@@ -328,6 +351,28 @@ func (s *Status) ReconcileAbort() {
 		s.Status = StatusAborted
 		s.Action = ""
 		pushTaskIDCompletedNoSync(s)
+	})
+}
+
+// ReconcileAbortWithReason marks reconcile abortion AND records a reason-tagged
+// error so callers can distinguish flavors of Aborted (e.g. FIPSValidationFailed)
+// from the generic case. The reason is prepended to the message in `[reason] msg`
+// form — operators and dashboards grep the error stream for the bracketed tag.
+func (s *Status) ReconcileAbortWithReason(reason, msg string) {
+	doWithWriteLock(s, func(s *Status) {
+		if s == nil {
+			return
+		}
+		s.Status = StatusAborted
+		s.Action = ""
+		pushTaskIDCompletedNoSync(s)
+		if (reason != "") || (msg != "") {
+			tagged := fmt.Sprintf("[%s] %s", reason, msg)
+			s.Errors = append([]string{tagged}, s.Errors...)
+			if len(s.Errors) > maxErrors {
+				s.Errors = s.Errors[:maxErrors]
+			}
+		}
 	})
 }
 
@@ -869,7 +914,16 @@ func getStringArrWithReadLock(s *Status, f func(*Status) []string) []string {
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return f(s)
+	// Return a COPY so callers may iterate the snapshot after the read lock is
+	// released without racing concurrent writers (PushError/SetAndPushError/
+	// ReconcileAbortWithReason mutate the underlying slice).
+	src := f(s)
+	if src == nil {
+		return emptyArr
+	}
+	cp := make([]string, len(src))
+	copy(cp, src)
+	return cp
 }
 
 // mergeActionsNoSync merges the actions of from into those of s (without synchronization, because synchronized

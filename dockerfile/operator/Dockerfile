@@ -8,13 +8,14 @@ FROM --platform=${BUILDPLATFORM} golang:${GO_VERSION:-latest} AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG BUILDARCH=amd64
 ARG GCFLAGS
 
 # Install required packages
 RUN apt-get update && \
     apt-get install -y apt-utils && \
     apt-get install -y gettext-base wget xz-utils
-RUN wget -O /usr/bin/yq --progress=bar:force:noscroll "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64" && \
+RUN wget -O /usr/bin/yq --progress=bar:force:noscroll "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${BUILDARCH}" && \
     chmod +x /usr/bin/yq
 RUN PLATFORM="x86_64" && if [ "${TARGETARCH}" = "arm64" ]; then PLATFORM="aarch64"; fi && \
     wget -O /tmp/bash --progress=bar:force:noscroll "https://github.com/robxu9/bash-static/releases/latest/download/bash-linux-${PLATFORM}" && \
@@ -40,6 +41,8 @@ RUN OPERATOR_BIN=/tmp/clickhouse-operator bash -xe ./dev/go_build_operator.sh
 # == Delve builder ==
 # ===================
 FROM --platform=${BUILDPLATFORM} golang:${GO_VERSION:-latest} AS delve-builder
+ARG TARGETOS
+ARG TARGETARCH
 RUN CGO_ENABLED=0 GO111MODULE=on GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
     go install -ldflags "-s -w -extldflags '-static'" github.com/go-delve/delve/cmd/dlv@latest && \
     rm -rf /root/.cache/go-build/ /go/pkg/mod/

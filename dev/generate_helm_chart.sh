@@ -214,11 +214,18 @@ function update_deployment_resource() {
   yq e -i '.spec.template.spec.securityContext |= "{{ toYaml .Values.podSecurityContext | nindent 8 }}"' "${file}"
   yq e -i '.spec.template.spec.topologySpreadConstraints |= "{{ toYaml .Values.topologySpreadConstraints | nindent 8 }}"' "${file}"
 
-  for cm in $(yq e '.spec.template.spec.volumes[].configMap.name' "${file}"); do
+  # Iterate only over volumes that actually use a configMap source. The plain
+  # `.volumes[].configMap.name` form yields a literal `null` for non-configMap
+  # volumes (e.g. emptyDir for the IPC token share); processing that `null`
+  # downstream produces a malformed volume entry with both source kinds set
+  # and a checksum annotation referencing a non-existent ConfigMap-null.yaml.
+  for cm in $(yq e '.spec.template.spec.volumes[] | select(.configMap != null) | .configMap.name' "${file}"); do
     local prefix='{{ include \"altinity-clickhouse-operator.fullname\" . }}'
     local newCm="${cm/etc-clickhouse-operator/$prefix}"
     newCm="${newCm/etc-keeper-operator/${prefix}-keeper}"
-    yq e -i '(.spec.template.spec.volumes[].configMap.name | select(. == "'"${cm}"'") | .) |= "'"${newCm}"'"' "${file}"
+    # Filter at the volume level so `|=` does not auto-create `.configMap.name`
+    # on non-configMap volumes (e.g. emptyDir for the IPC token share).
+    yq e -i '(.spec.template.spec.volumes[] | select(.configMap != null) | .configMap.name | select(. == "'"${cm}"'")) |= "'"${newCm}"'"' "${file}"
     local cmName="${cm/etc-clickhouse-operator-/}"
     cmName="${cmName/etc-keeper-operator-/keeper-}"
     yq e -i '.spec.template.metadata.annotations += {"checksum/'"${cmName}"'": "{{ include (print $.Template.BasePath \"/generated/ConfigMap-'"${cm}"'.yaml\") . | sha256sum }}"}' "${file}"

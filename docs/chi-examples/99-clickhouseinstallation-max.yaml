@@ -322,6 +322,35 @@ spec:
     - name: template2
       # No namespace specified - use CHI namespace
 
+  # CHI-level security defaults. Inherited by every cluster that does not override.
+  # Operator-wide defaults live in ClickHouseOperatorConfiguration (chopconf) and
+  # cascade chopconf → CHI spec → cluster spec; lower level wins.
+  # All fields default to nil/empty so an upgrade preserves identical behavior.
+  security:
+    clickhouse:
+      # Outbound TLS knobs for the operator's ClickHouse client.
+      tls:
+        # Strict | None | "" (unset: legacy InsecureSkipVerify=true preserved).
+        verify: ""
+        # "1.2" | "1.3" | "" (Go stdlib default).
+        minVersion: ""
+        # SNI / cert-verify name override. Empty derives from dial host.
+        serverName: ""
+        # Inline PEM CA bundle. Mutually exclusive with rootCASecretRef below.
+        rootCA: ""
+        # Alternate source: read PEM CA from a Kubernetes Secret in this CHI's
+        # namespace. When Key is empty, the operator tries "ca.crt" then "tls.crt".
+        rootCASecretRef:
+          name: ""
+          key: ""
+    zookeeper:
+      # Outbound TLS knobs for the operator's ZooKeeper / Keeper client.
+      tls:
+        verify: ""
+        minVersion: ""
+    # Note: Kubernetes-API-client TLS is operator-process-scoped — there is no
+    # per-CHI override. Configure it in ClickHouseOperatorConfiguration only.
+
   defaults:
     replicasUseFQDN: "no"
     distributedDDL:
@@ -443,6 +472,31 @@ spec:
         layout:
           shardsCount: 3
           replicasCount: 2
+
+        # Cluster-level security knobs. Same shape as spec.security above; values
+        # here win over CHI-level and chopconf-level defaults (fill-empty merge).
+        security:
+          clickhouse:
+            tls:
+              # Strict | None | "" (inherit / legacy InsecureSkipVerify=true).
+              verify: ""
+              # "1.2" | "1.3" | "" (Go stdlib default).
+              minVersion: ""
+              # SNI / cert-verify name override. Empty derives from dial host.
+              serverName: ""
+              # Inline PEM CA bundle. Mutually exclusive with rootCASecretRef below.
+              rootCA: ""
+              # Alternate source: read PEM CA from a Kubernetes Secret in the CHI's
+              # namespace. When Key is empty, the operator tries "ca.crt" then "tls.crt".
+              rootCASecretRef:
+                name: ""
+                key: ""
+          zookeeper:
+            tls:
+              verify: ""
+              minVersion: ""
+          # Kubernetes-API-client TLS is operator-process-scoped — no per-cluster
+          # override exists. Configure it in ClickHouseOperatorConfiguration only.
         reconcile:
           # Optional, overwrites reconcile.runtime from the operator's config
           runtime:

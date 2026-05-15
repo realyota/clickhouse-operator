@@ -236,11 +236,10 @@ def test_010006_2(self):
             pod_name = kubectl.get_pod_names(chi)[0]
             for i in range(15):
                 container_status = kubectl.get_field("pod", pod_name, ".status.containerStatuses[0].state.waiting.reason",)
-                print(f"{pod_name} is {container_status}")
                 if container_status == "CrashLoopBackOff":
                     print(kubectl.get_field("pod", pod_name, ".status.containerStatuses[0].state.waiting.message"))
                     break
-                time.sleep(5)
+                retry_sleep(1, 5, f"{pod_name} is {container_status}")
             assert container_status not in ["CrashLoopBackOff","Error"]
 
         kubectl.wait_chi_status(chi, "Completed")
@@ -811,8 +810,7 @@ def test_010011_1(self):
                 )
                 if out != "OK":
                     break
-                print(f"Network restrictions not yet loaded on default-1-0, waiting 10s (attempt {i})")
-                time.sleep(10)
+                retry_sleep(1, 10, "Network restrictions not yet loaded on default-1-0")
             with And("Connection to localhost should succeed with default user"):
                 out = clickhouse.query_with_error(
                     "test-011-secured-cluster",
@@ -1124,12 +1122,11 @@ def test_010011_4(self):
                 if chi_status in ("Aborted", "Completed"):
                     break
                 container_status = kubectl.get_field("pod", pod, ".status.containerStatuses[0].state.waiting.reason")
-                print(f"{chi} status={chi_status} pod={pod} waiting_reason={container_status}")
                 assert container_status not in ["CrashLoopBackOff", "Error"], error(
                     f"{pod} entered {container_status} during secret-backed env rollout"
                 )
 
-                time.sleep(5)
+                retry_sleep(1, 5, f"{chi} status={chi_status} pod={pod} waiting_reason={container_status}")
 
             assert chi_status == "Completed", error(f"{chi} did not complete successfully")
 
@@ -2651,8 +2648,7 @@ def test_021(self, step=1):
                 out = clickhouse.query(chi, "SELECT count() FROM system.disks")
                 if out == "2":
                     break
-                with Then(f"Not ready yet. Wait for {1 << i} seconds"):
-                    time.sleep(1 << i)
+                retry_sleep(i, 5, "Not ready yet")
             assert out == "2"
 
         with And("Table should exist"):
@@ -3095,7 +3091,7 @@ def test_010025(self):
         lb_error_time = start_time
         distr_lb_error_time = start_time
         latent_replica_time = start_time
-        for i in range(1, 100):
+        for i in range(1, 10):
             cnt_local = clickhouse.query_with_error(
                 chi,
                 "SELECT count() FROM test_local_025",
@@ -3114,8 +3110,7 @@ def test_010025(self):
                     break
                 latent_replica_time = time.time()
                 note("Replicated table did not catch up")
-            note("Waiting 1 second.")
-            time.sleep(1)
+            retry_sleep(1, 5)
         note(
             f"Tables not ready: {round(distr_lb_error_time - start_time)}s, data not ready: {round(latent_replica_time - distr_lb_error_time)}s"
         )
@@ -4086,16 +4081,16 @@ def test_010036(self):
                 kubectl.launch(f"delete pvc {volume}-chi-test-036-volume-re-provisioning-simple-0-0-0")
 
                 with Then("Wait for StatefulSet is deleted"):
-                    for i in range(5):
+                    for i in range(10):
                         if kubectl.get_count("sts", "chi-test-036-volume-re-provisioning-simple-0-0") == 0:
                             break
-                        time.sleep(10)
+                        retry_sleep(1, 5, "StatefulSet is not deleted")
 
                 with Then("Wait for PVC is deleted"):
                     for i in range(5):
                         if kubectl.get_count("pvc", f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0") == 0:
                             break
-                        time.sleep(10)
+                        retry_sleep(1, 5, "PVC is not deleted")
 
             assert kubectl.get_count("sts", "chi-test-036-volume-re-provisioning-simple-0-0") == 0, "StatefulSet is not deleted"
             assert kubectl.get_count("pvc", f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0") == 0, "PVC is not deleted"
@@ -4116,10 +4111,10 @@ def test_010036(self):
                 # restart pod to make sure volume is unmounted
                 kubectl.launch("delete pod chi-test-036-volume-re-provisioning-simple-0-0-0")
                 with Then("Wait for PVC is deleted"):
-                    for i in range(5):
+                    for i in range(10):
                         if kubectl.get_count("pvc", f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0") == 0:
                             break
-                        time.sleep(10)
+                        retry_sleep(1, 5, "PVC is not deleted")
 
                 with Then("PVC should be deleted, PV should be deleted as well"):
                     new_pvc_count = kubectl.get_count("pvc", chi=chi)

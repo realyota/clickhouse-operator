@@ -24,8 +24,7 @@ def get_shell(self, timeout=600):
         shell.timeout = timeout
         yield shell
     finally:
-        with Finally("I close shell"):
-            shell.close()
+        shell.close()
 
 
 @TestStep(Given)

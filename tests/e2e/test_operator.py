@@ -6616,29 +6616,53 @@ def test_010069(self):
 
 
 @TestScenario
-@Name("test_010070. Zero-regression: CHI without any security block behaves identically to pre-0.27.1")
+@Name("test_010070. Security feature is opt-in: omitting the security block round-trips cleanly with no STS churn")
 @Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
 def test_010070(self):
-    """A CHI with NO security:* block anywhere (chopconf, CHI spec,
-    cluster). The operator must:
-      1. Reconcile successfully (no schema-rejection on the new fields).
-      2. Use the legacy TLS registration path (operator log contains the
-         "no security knobs set, using legacy registration" marker only when
-         setupTLSAdvanced is invoked — which for an HTTP-only CHI never
-         happens; in that case we just verify zero errors).
-      3. Provision NO IPC token (Plain mode).
+    """Verifies three properties that distinguish this test from the rest of
+    the suite, where most tests also happen to omit security but never check
+    these invariants explicitly:
 
-    This is the explicit zero-regression upgrade guarantee — any future
-    refactor that injects a non-nil Security{} default would surface as a
-    schema mismatch or pod roll, and this test would catch it.
+      INVARIANT A — CRD schema accepts the new security fields when absent.
+        After the security CRD properties were added, a CHI that DOES NOT
+        set them must still validate. A typo in `required:` on any of the
+        new security sub-fields would make every old-shape CHI fail at
+        kubectl apply time. test_010001 etc. would catch that, but only as
+        a symptom ("apply rejected") — here we make the contract explicit.
+
+      INVARIANT B — Normalizer does NOT inject a default Security struct.
+        The operator round-trips the CHI through CreateTemplated → normalize
+        → MergeFrom. After that round-trip, .spec.security MUST stay empty.
+        If a future refactor wrote `cr.Spec.Security = &ClusterSecurity{}`
+        unconditionally (e.g. to simplify nil-handling downstream), the
+        round-tripped object would persist {} instead of being absent —
+        breaking pre-0.27.1 manifests' on-disk shape and triggering rolling
+        restarts on operator upgrade. This invariant is unique to this test;
+        no other test in the suite asserts the absence shape post-normalize.
+
+      INVARIANT C — Re-apply of the same no-security CHI MUST NOT roll the
+        StatefulSet. The most subtle regression vector: the normalizer
+        injects a zero-value Security{} on the second pass that differs
+        byte-wise from the first pass's nil. The pod-template diff sees a
+        change, increments .status.generation, and rolls every pod. This
+        invariant catches that class of bug — empty-vs-nil normalize drift.
+        No other test in the suite exercises double-apply on a no-security
+        manifest specifically to assert generation stability.
+
+    This test is the explicit zero-regression anchor for the FIPS feature
+    family (010065-010073). The other family members all SET some security
+    knob; this one is the negative control that proves opt-out is a stable,
+    first-class configuration.
     """
     create_shell_namespace_clickhouse_template()
 
     manifest = "manifests/chi/test-070-no-security.yaml"
     chi = yaml_manifest.get_name(util.get_full_path(manifest))
-    operator_namespace = current().context.operator_namespace
 
-    with When("Apply a CHI with no security block"):
+    with Given("Apply a CHI with no security block — Invariant A: CRD schema accepts it"):
+        # If the CRD schema were broken (e.g. accidental required: on a
+        # security sub-field), create_and_check would fail at apply time
+        # before reconcile begins. Reaching Completed proves Invariant A.
         kubectl.create_and_check(
             manifest=manifest,
             check={
@@ -6648,24 +6672,52 @@ def test_010070(self):
             },
         )
 
-    with Then("CHI has no .spec.security field populated"):
+    with Then("Invariant B: .spec.security stays empty post-normalize round-trip"):
+        # Operator does CreateTemplated → MergeFrom into target → write back
+        # .status.normalizedCR. If normalize injected `&ClusterSecurity{}`,
+        # the field would marshal as {} on the wire instead of being absent.
+        # jsonpath returns the empty string for both "key absent" and
+        # "key present but null" — both are acceptable absence shapes.
         sec = kubectl.launch(
             f"get chi {chi} -o jsonpath='{{.spec.security}}'"
         ).strip().strip("'")
-        assert sec == "", error(f"no-security CHI should have no .spec.security, got: {sec!r}")
+        assert sec == "", error(
+            f"Invariant B violated: .spec.security should be absent after "
+            f"round-trip, got: {sec!r}. A non-empty value here means the "
+            f"normalizer is injecting a default Security struct that wasn't "
+            f"in the user's manifest, breaking the absent-state contract."
+        )
 
-    with And("Operator pod is NOT in Secure IPC mode (no token file exists)"):
-        operator_pod = kubectl.get_operator_pod()
-        out = kubectl.launch(
-            f"exec {operator_pod} -c clickhouse-operator -- sh -c "
-            f"'[ -f /etc/clickhouse-operator-ipc/token ] && echo present || echo absent'",
-            ns=operator_namespace,
-            ok_to_fail=True,
-        ).strip()
-        # In Plain mode the file MAY exist from a prior test in the same operator
-        # pod, but it MUST not be referenced by this CHI's reconcile path.
-        # Accept either "absent" or "present" — what we really test is below.
-        assert out in ("absent", "present"), error(f"unexpected token-file probe output: {out!r}")
+    sts_name = f"chi-{chi}-default-0-0"
+    with And("Record StatefulSet generation before re-apply"):
+        gen_before = kubectl.launch(
+            f"get sts {sts_name} -o jsonpath='{{.metadata.generation}}'"
+        ).strip().strip("'")
+        assert gen_before, error(f"could not read STS generation: {gen_before!r}")
+
+    with When("Re-apply the identical no-security manifest"):
+        # Second normalize pass through the same CHI must produce
+        # byte-identical output to the first pass. If it doesn't, the
+        # operator detects a spec change and bumps the STS generation,
+        # rolling the pods. The wait_chi_status loop in create_and_check is
+        # already over; we just apply and observe sts.metadata.generation.
+        kubectl.apply(util.get_full_path(manifest, lookup_in_host=False))
+        # Allow a brief settle window for the operator informer to react
+        # to the apply event before re-reading generation.
+        kubectl.wait_chi_status(chi, "Completed", retries=10)
+
+    with Then("Invariant C: StatefulSet generation did NOT change on re-apply"):
+        gen_after = kubectl.launch(
+            f"get sts {sts_name} -o jsonpath='{{.metadata.generation}}'"
+        ).strip().strip("'")
+        assert gen_after == gen_before, error(
+            f"Invariant C violated: STS generation drifted {gen_before!r} → "
+            f"{gen_after!r} after re-applying an IDENTICAL no-security CHI. "
+            f"This indicates the normalizer is not byte-stable on the absent "
+            f"path — a likely cause is `&ClusterSecurity{{}}` injection that "
+            f"differs from nil. Rolling every pod on operator upgrade for "
+            f"users who never set security knobs is the regression to catch."
+        )
 
     with Finally("I clean up"):
         delete_test_namespace()

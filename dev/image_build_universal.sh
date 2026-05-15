@@ -9,6 +9,7 @@ DOCKERFILE="${DOCKERFILE_DIR}/Dockerfile"
 DOCKERHUB_LOGIN="${DOCKERHUB_LOGIN}"
 DOCKERHUB_PUBLISH="${DOCKERHUB_PUBLISH:-"no"}"
 MINIKUBE="${MINIKUBE:-"no"}"
+MINIKUBE_PLATFORM="${MINIKUBE_PLATFORM:-""}"
 
 # Source-dependent options
 CUR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
@@ -22,7 +23,9 @@ cat << EOF
 Build vars:
 DOCKERHUB_LOGIN=${DOCKERHUB_LOGIN}
 DOCKERHUB_PUBLISH=${DOCKERHUB_PUBLISH}
+DOCKER_IMAGE=${DOCKER_IMAGE}
 MINIKUBE=${MINIKUBE}
+MINIKUBE_PLATFORM=${MINIKUBE_PLATFORM}
 EOF
 
 if [[ "${MINIKUBE}" == "yes" ]]; then
@@ -66,13 +69,49 @@ chop_docker_config_without_creds_if_helper_missing() {
 }
 chop_docker_config_without_creds_if_helper_missing
 
-# Minikube dev images are linux/amd64-only; skip host qemu/binfmt setup (needs docker run).
-# In case architecture of the host we are building on is arm，such as MacOS M1/M2, no need to install qemu
+normalize_image_build_architecture() {
+    local arch="${1}"
+    arch="${arch#linux/}"
+    case "${arch}" in
+        amd64|x86_64)
+            echo "amd64"
+            ;;
+        arm64|aarch64)
+            echo "arm64"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+MINIKUBE_BUILD_ARCH="amd64"
+if [[ "${MINIKUBE}" == "yes" ]]; then
+    if [[ -n "${MINIKUBE_PLATFORM}" ]]; then
+        if ! MINIKUBE_BUILD_ARCH="$(normalize_image_build_architecture "${MINIKUBE_PLATFORM}")"; then
+            echo "ERROR: unsupported MINIKUBE_PLATFORM=${MINIKUBE_PLATFORM}; expected linux/amd64 or linux/arm64." >&2
+            exit 1
+        fi
+    else
+        MINIKUBE_DOCKER_ARCH="$(docker info --format '{{.Architecture}}' 2>/dev/null || true)"
+        if [[ -z "${MINIKUBE_DOCKER_ARCH}" ]]; then
+            MINIKUBE_DOCKER_ARCH="$(uname -m)"
+            echo "WARNING: unable to read Docker daemon architecture; falling back to host architecture ${MINIKUBE_DOCKER_ARCH}." >&2
+        fi
+        if ! MINIKUBE_BUILD_ARCH="$(normalize_image_build_architecture "${MINIKUBE_DOCKER_ARCH}")"; then
+            echo "ERROR: unsupported Docker daemon architecture ${MINIKUBE_DOCKER_ARCH}; expected amd64/x86_64 or arm64/aarch64." >&2
+            exit 1
+        fi
+    fi
+fi
+
+# Minikube dev images are loaded into one Docker daemon architecture; skip host qemu/binfmt setup (needs docker run).
+# In case architecture of the host we are building on is arm, such as MacOS M1/M2, no need to install qemu
 # We may need to install qemu otherwise
 ARCHITECTURE=$(uname -m)
 if [[ "${MINIKUBE}" == "yes" ]]; then
-    echo "MINIKUBE=yes: skipping multiarch/qemu-user-static setup (single-platform amd64 build)."
-elif [[ "${ARCHITECTURE}" =~ "arm" ]]; then
+    echo "MINIKUBE=yes: skipping multiarch/qemu-user-static setup (single-platform ${MINIKUBE_BUILD_ARCH} build)."
+elif [[ "${ARCHITECTURE}" =~ "arm" || "${ARCHITECTURE}" == "aarch64" ]]; then
     echo "Build host is arm and does not need qemu to be installed"
 else
     echo "Need qemu to be installed on build host"
@@ -115,12 +154,15 @@ fi
 # Base docker build command
 DOCKER_CMD="docker buildx build --progress plain"
 
-# Append arch
-if [[ "${DOCKER_IMAGE}" =~ ":dev" || "${MINIKUBE}" == "yes" ]]; then
+# Append arch. Minikube platform wins over the dev tag so DOCKER_IMAGE=:dev does not force amd64.
+if [[ "${MINIKUBE}" == "yes" ]]; then
+    echo "Build image for Minikube Docker daemon architecture (${MINIKUBE_BUILD_ARCH}) only."
+    DOCKER_CMD="${DOCKER_CMD} --platform=linux/${MINIKUBE_BUILD_ARCH} --load"
+elif [[ "${DOCKER_IMAGE}" =~ ":dev" ]]; then
     echo "Build image (dev) for amd64 only, skip arm arch."
+    DOCKER_CMD="${DOCKER_CMD} --platform=linux/amd64 --load"
     # Single --load into local docker (replaces invalid double --output: type=docker + type=image;
     # buildx errors: "multiple outputs currently unsupported".)
-    DOCKER_CMD="${DOCKER_CMD} --platform=linux/amd64 --load"
 else
     echo "Build image for both amd64 and arm64."
     DOCKER_CMD="${DOCKER_CMD} --platform=linux/amd64,linux/arm64"

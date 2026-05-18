@@ -7549,43 +7549,29 @@ def test_020009(self):
     error stream.
     """
     create_shell_namespace_clickhouse_template()
-    try:
-        chopconf_file = "manifests/chopconf/test-073-fips-strict-chopconf.yaml"
-        chk_manifest = "manifests/chk/test-020009-chk-fips-bypass-rejected.yaml"
-        chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
 
-        with Given("Apply Strict FIPS chopconf and restart operator"):
-            util.apply_operator_config(chopconf_file)
+    chopconf_file = "manifests/chopconf/test-073-fips-strict-chopconf.yaml"
+    chk_manifest = "manifests/chk/test-020009-chk-fips-bypass-rejected.yaml"
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
 
-        with When("Apply CHK with spec-level security bypass"):
-            kubectl.apply(util.get_full_path(chk_manifest))
+    with Given("Apply Strict FIPS chopconf and restart operator"):
+        util.apply_operator_config(chopconf_file)
 
-        with Then("CHK lands in status=Aborted with [FIPSValidationFailed] reason"):
-            deadline = time.time() + 60
-            status = ""
-            errors = ""
-            while time.time() < deadline:
-                status = kubectl.launch(
-                    f"get chk {chk} -o jsonpath='{{.status.status}}'",
-                    ok_to_fail=True,
-                ).strip().strip("'")
-                errors = kubectl.launch(
-                    f"get chk {chk} -o jsonpath='{{.status.errors[*]}}'",
-                    ok_to_fail=True,
-                ).strip().strip("'")
-                if (status == "Aborted") and ("FIPSValidationFailed" in errors):
-                    break
-                time.sleep(3)
-            assert status == "Aborted", error(f"expected status=Aborted, got {status!r}")
-            assert "FIPSValidationFailed" in errors, error(
-                f"expected [FIPSValidationFailed] reason in status.errors, got {errors!r}"
-            )
-    finally:
-        # Remove the CHK explicitly — delete_test_namespace also cleans up but
-        # the FIPS-aborted CR may need an explicit delete first.
-        kubectl.launch(f"delete chk {chk}", ok_to_fail=True)
-        with Finally("I clean up"):
-            delete_test_namespace()
+    with When("Apply CHK with spec-level security bypass"):
+        kubectl.apply(util.get_full_path(chk_manifest))
+
+    with Then("CHK lands in status=Aborted"):
+        kubectl.wait_chk_status(chk, 'Aborted')
+
+    with And("Aborted reason is [FIPSValidationFailed]"):
+        errors = kubectl.get_field('chk', chk, '.status.errors')
+        print(errors)
+        assert "FIPSValidationFailed" in errors, error(
+                f"expected [FIPSValidationFailed] reason in status.errors, got {errors}"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
 
 
 @TestScenario
@@ -7602,41 +7588,28 @@ def test_020010(self):
     so dashboards keyed on the CHI reason continue working for CHK aborts.
     """
     create_shell_namespace_clickhouse_template()
-    try:
-        chopconf_file = "manifests/chopconf/test-074-fips-images-required-chopconf.yaml"
-        chk_manifest = "manifests/chk/test-020010-chk-fips-images-required-non-fips.yaml"
-        chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
 
-        with Given("Apply FIPS image-policy=Required chopconf and restart operator"):
-            util.apply_operator_config(chopconf_file)
+    chopconf_file = "manifests/chopconf/test-074-fips-images-required-chopconf.yaml"
+    chk_manifest = "manifests/chk/test-020010-chk-fips-images-required-non-fips.yaml"
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
 
-        with When("Apply CHK whose default Keeper image lacks the 'fips' tag substring"):
-            kubectl.apply(util.get_full_path(chk_manifest))
+    with Given("Apply FIPS image-policy=Required chopconf and restart operator"):
+        util.apply_operator_config(chopconf_file)
 
-        with Then("CHK lands in status=Aborted with [FIPSImagePolicyViolation] reason"):
-            deadline = time.time() + 60
-            status = ""
-            errors = ""
-            while time.time() < deadline:
-                status = kubectl.launch(
-                    f"get chk {chk} -o jsonpath='{{.status.status}}'",
-                    ok_to_fail=True,
-                ).strip().strip("'")
-                errors = kubectl.launch(
-                    f"get chk {chk} -o jsonpath='{{.status.errors[*]}}'",
-                    ok_to_fail=True,
-                ).strip().strip("'")
-                if (status == "Aborted") and ("FIPSImagePolicyViolation" in errors):
-                    break
-                time.sleep(3)
-            assert status == "Aborted", error(f"expected status=Aborted, got {status!r}")
-            assert "FIPSImagePolicyViolation" in errors, error(
-                f"expected [FIPSImagePolicyViolation] reason in status.errors, got {errors!r}"
-            )
-    finally:
-        kubectl.launch(f"delete chk {chk}", ok_to_fail=True)
-        with Finally("I clean up"):
-            delete_test_namespace()
+    with When("Apply CHK whose default Keeper image lacks the 'fips' tag substring"):
+        kubectl.apply(util.get_full_path(chk_manifest))
+
+    with Then("CHK lands in status=Aborted"):
+        kubectl.wait_chk_status(chk, 'Aborted')
+
+    with And("Aborted reason is [FIPSImagePolicyViolation]"):
+        errors = kubectl.get_field('chk', chk, '.status.errors')
+        assert "FIPSImagePolicyViolation" in errors, error(
+            f"expected [FIPSImagePolicyViolation] reason in status.errors, got {errors}"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
 
 
 def cleanup_chis(self):

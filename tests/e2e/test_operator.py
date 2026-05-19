@@ -5268,7 +5268,7 @@ def test_010051(self):
     chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
     operator_namespace = current().context.operator_namespace
 
-    def wait_metrics_state(description, present_patterns=None, absent_patterns=None, max_retries=12):
+    def wait_metrics_state(description, present_patterns=None, absent_patterns=None, max_retries=10):
         present_patterns = present_patterns or []
         absent_patterns = absent_patterns or []
         with Then(description):
@@ -5276,8 +5276,7 @@ def test_010051(self):
             absent_rx = [re.compile(pattern, re.MULTILINE) for pattern in absent_patterns]
             out = ""
             for i in range(1, max_retries):
-                operator_pod = kubectl.get_operator_pod()
-                out = util.get_metrics(operator_pod, operator_namespace)
+                out = util.get_metrics()
 
                 present = all(rx.search(out) is not None for rx in present_rx)
                 absent  = all(rx.search(out) is None for rx in absent_rx)
@@ -5289,9 +5288,11 @@ def test_010051(self):
                     return out
 
                 retry_sleep(i, 5, "Metrics are not ready")
+
+            print(out)
             assert False, error("Metrics do not match present/absent patterns")
 
-    with Given("Operator configuration with disabled metric exclusions is installed"):
+    with Given("Operator configuration with custom metric exclusions is installed"):
         util.apply_operator_config(chopconf_file)
 
     with Given("CHI is installed"):
@@ -5307,23 +5308,31 @@ def test_010051(self):
             },
         )
 
+    with Then("Create a table with one part"):
+        clickhouse.query(chi, "CREATE TABLE test (a String) Engine = MergeTree ORDER BY a PARTITION BY a")
+        clickhouse.query(chi, "INSERT INTO test SELECT 'This is a test'");
+
     cpu_metric_pattern = r"^chi_clickhouse_metric_(OS.*CPU[0-9]+|CPUFrequencyMHz_[0-9]+)\{"
     version_metric_pattern = r"^chi_clickhouse_metric_VersionInteger.*"
+    table_in_metric_pattern = r"^chi_clickhouse_table_partitions.*"
+    table_ex_metric_pattern = r"^chi_clickhouse_table_parts_bytes_uncompressed.*"
 
     wait_metrics_state(
         "CPU-related and VersionInteger ClickHouse metrics should exist when exclusions are disabled",
-        present_patterns=[cpu_metric_pattern, version_metric_pattern],
+        present_patterns=[cpu_metric_pattern, version_metric_pattern, table_in_metric_pattern],
+        absent_patterns=[table_ex_metric_pattern]
     )
 
     with When("CHOP configuration is deleted to restore default metric exclusions"):
         kubectl.delete(util.get_full_path(chopconf_file, lookup_in_host=False), operator_namespace)
         util.restart_operator()
+        kubectl.wait_chi_status(chi, 'Completed')
 
     # Bumped to 24 retries (~10 min). Default 12 (~4 min) was too tight after restart_operator
-    # on slow CI runners — VersionInteger sometimes hadn't re-appeared before the wait expired.
+    # on slow CI runners — operator can not scrape ClickHouse metrics until new IP address is picked up.
     wait_metrics_state(
         "CPU-related ClickHouse metrics should disappear while VersionInteger remains when exclusions are enabled",
-        present_patterns=[version_metric_pattern],
+        present_patterns=[version_metric_pattern, table_ex_metric_pattern],
         absent_patterns=[cpu_metric_pattern],
         max_retries=24,
     )

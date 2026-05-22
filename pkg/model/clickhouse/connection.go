@@ -34,6 +34,15 @@ import (
 // const clickHouseDriverName = "clickhouse"
 const clickHouseDriverName = "chhttp"
 
+// init registers the legacy `tlsSettingsLegacy` DSN key with an insecure
+// TLS config for pre-0.27.1 back-compat. Under FIPS-enforced startup the
+// chop fipsGate (cmd/operator/app/fips_gate.go, cmd/metrics_exporter/app/
+// fips_gate.go) calls EnforceVerifiedLegacyTLS *before* any DB connect
+// is opened, re-registering the same key with a verifying config. This
+// invariant is load-bearing: any new caller that establishes a ClickHouse
+// connection before fipsGate runs would bypass the verified-TLS override.
+// Don't import this package from early-init paths (flag parsers, version
+// commands) without keeping the gate-first ordering intact.
 func init() {
 	setupTLSBasic()
 }

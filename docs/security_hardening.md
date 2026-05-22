@@ -957,12 +957,15 @@ workflow with a different cadence.
 
 #### What is still pending
 
-The pipeline does not yet cover two follow-ups that are commonly grouped
-with release evidence:
+Cosign signing now ships as a separate workflow
+(`.github/workflows/cosign_sign.yaml`) chained off `build_branch` via
+`workflow_run`, signing the immutable `<image>@sha256:...` digest (not the
+floating tag) via Sigstore keyless OIDC. Signatures are verified in the same
+job and the resulting evidence is uploaded as `cosign-evidence-<branch>`
+with 365-day retention.
 
-- **Cosign signing (Sigstore keyless via OIDC)**: the workflow already
-  carries `id-token: write` permissions, but the actual `cosign sign`
-  invocation is a planned follow-up rather than a current release-gate.
+One follow-up remains:
+
 - **Reproducible builds**: `dev/go_build_universal.sh` passes `-trimpath`
   and `-buildvcs=true`, which removes the obvious sources of variance,
   but bit-identical multi-arch builds are not enforced as a release-gate.

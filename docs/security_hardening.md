@@ -966,9 +966,11 @@ with 365-day retention.
 
 One follow-up remains:
 
-- **Reproducible builds**: `dev/go_build_universal.sh` passes `-trimpath`
-  and `-buildvcs=true`, which removes the obvious sources of variance,
-  but bit-identical multi-arch builds are not enforced as a release-gate.
+- **Reproducible builds**: `dev/go_build_universal.sh` does not currently
+  pass `-trimpath` or `-buildvcs=true`, and bit-identical multi-arch
+  builds are not enforced as a release-gate. The release-evidence
+  pipeline pins the resulting image by digest, which preserves
+  identity verifiability without requiring bit-reproducibility.
 
 #### Retention
 

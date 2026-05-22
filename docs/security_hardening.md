@@ -752,28 +752,23 @@ glibc/OpenSSL dependency). Supported architectures: `linux/amd64`,
 `linux/arm64` (see `dockerfile/operator/Dockerfile` `image-base-amd64` /
 `image-base-arm64` stages).
 
-### Runtime modes — default vs strict
+### Runtime mode
 
-Two runtime modes are available:
+The operator and metrics-exporter images ship with `GODEBUG=fips140=on` as the
+default. This mode filters TLS versions, cipher suites, signature algorithms,
+key exchanges, and certificate chains to FIPS-approved primitives, while
+permitting non-security uses of MD5/SHA-1 (see "Non-security hash exclusions"
+below).
 
 | Mode | `GODEBUG` value | What it does | Image tag |
 |---|---|---|---|
 | Default | `fips140=on` | Filters TLS versions, cipher suites, signature algorithms, key exchanges, FIPS-compatible certificate chains | `altinity/clickhouse-operator:<version>` |
-| Strict | `fips140=only` | Above + panics on any non-approved cryptographic primitive (defense-in-depth) | `altinity/clickhouse-operator:<version>-fips` (planned — see note below) |
 
-The default image is FIPS-compatible by Go runtime mode (`fips140=on`), built
-with `GOFIPS140=v1.0.0`. The strict variant additionally panics on any
-non-approved primitive — useful for FIPS-audit deployments but stricter than
-the spec requires.
-
-> **Strict variant status**: the `:<version>-fips` image tag is documented
-> here as a planned opt-in variant. A separate Dockerfile target and CI
-> workflow to build/publish it have NOT yet shipped. To run with strict mode
-> today, override at container start: `-e GODEBUG=fips140=only` (also requires
-> a build with no MD5/SHA-1 in security-sensitive paths — the non-security
-> hash exclusions documented below would panic). The strict tag will be
-> introduced once a complete build+test pipeline lands per the FIPS scope
-> document's §5 release-evidence requirements.
+To exercise the stricter `fips140=only` mode (which panics on any non-approved
+primitive, including the non-security MD5/SHA-1 sites listed below) at
+container-run time, override `-e GODEBUG=fips140=only`. The default image is
+the only published image — there is no separate `:<version>`-suffixed FIPS
+build.
 
 ### Knobs
 
@@ -798,7 +793,7 @@ the spec requires.
 
 ```bash
 docker run --rm --entrypoint=/bin/sh altinity/clickhouse-operator:<tag> \
-    -c 'echo $GODEBUG'   # expect: fips140=on (or fips140=only for the -fips variant)
+    -c 'echo $GODEBUG'   # expect: fips140=on
 go version -m dev/bin/clickhouse-operator | grep GOFIPS140
 ```
 
@@ -812,8 +807,8 @@ FIPS: chopconf.policy=… build.enabled=… runtime.enforced=… module=v1.0.0
 
 `tests/e2e/test_operator.py::test_010076` reads the operator startup banner
 emitted by `cmd/operator/app/fips_gate.go` and fails the run if
-`build.enabled` reports `false`. The default image asserts only the build
-linkage; the strict variant adds `runtime.enforced=true` to the assertion.
+`build.enabled` reports `false`. The shipped image asserts the build linkage
+against the Go FIPS 140-3 module.
 
 Local e2e (`tests/e2e/run_tests_local.sh`) rebuilds operator + metrics-
 exporter via `dev/image_build_all_dev.sh`, which defaults `GOFIPS140=v1.0.0`
@@ -837,9 +832,9 @@ following sites are explicitly **outside the FIPS cryptographic boundary**:
 
 These are deterministic-ID helpers retained for back-compat (changing them
 re-hashes every K8s object's label on upgrade). Scanner reports against these
-files are out of scope. The default runtime (`fips140=on`) permits them; the
-strict `-fips` variant (`fips140=only`) would panic on them, which is why the
-strict variant is opt-in and not the shipped default.
+files are out of scope. The shipped runtime (`fips140=on`) permits them;
+overriding the container to `GODEBUG=fips140=only` would panic on these
+sites, which is why the shipped default is `fips140=on`.
 
 In addition, the following vendored telemetry libraries contain internal
 non-security hashing / sampling that is **outside the FIPS cryptographic
@@ -872,8 +867,8 @@ so a non-FIPS chain may sit dormant until the first dial.
   env-var-name uniqueness. Documented as outside the FIPS cryptographic
   boundary per the FIPS scope specification (§3, see this document for the
   operator-side boundary and [Go FIPS 140-3 mode](https://go.dev/doc/security/fips140)
-  for the Go-side runtime semantics); the default `fips140=on` runtime
-  permits it, while the opt-in `fips140=only` strict-mode image would panic
+  for the Go-side runtime semantics); the shipped `fips140=on` runtime
+  permits it, while a container-level override to `fips140=only` would panic
   on it.
 
 ### ZooKeeper digest-auth policy
@@ -905,28 +900,88 @@ Per the FIPS scope specification (Release Gate item #12, see the
 operator-side boundary documented in this file together with
 [Go FIPS 140-3 mode](https://go.dev/doc/security/fips140) for the Go-side
 runtime semantics), a FIPS-tagged release must archive "image digest, SBOM,
-build logs, and test report". A FIPS-tagged release should archive:
+build logs, and test report". The release pipeline now produces this
+evidence automatically; the subsections below describe what ships, how to
+verify it, and what is still planned.
 
-- **Image digest**: capture from the buildx push step output, or:
-  ```bash
-  docker buildx imagetools inspect altinity/clickhouse-operator:<version> --format '{{.Manifest.Digest}}'
-  ```
-- **SBOM**: any standard tool. With [`syft`](https://github.com/anchore/syft):
-  ```bash
-  syft altinity/clickhouse-operator:<version> -o spdx-json=clickhouse-operator-<version>.sbom.spdx.json
-  syft altinity/metrics-exporter:<version>    -o spdx-json=metrics-exporter-<version>.sbom.spdx.json
-  ```
-- **Provenance / attestation**: `docker buildx build --provenance=true --sbom=true` produces in-toto attestations alongside the image manifest. Inspect with `docker buildx imagetools inspect <ref> --format '{{json .}}'`.
-- **Build logs**: GitHub Actions runs already retain workflow logs; download
-  the `build_master.yaml` or `build_branch.yaml` run artifact.
-- **Test report**: TestFlows produces a `testflows.*.log` per run; capture
-  alongside the operator pod logs (`/tmp/e2e_suite.log`) and the
-  `kubectl get events --all-namespaces` snapshot at run end.
+#### What ships per release (automated)
 
-Archive all five into the release notes attachment or an internal artifact
-store. The repository does not yet ship a CI workflow that does this
-automatically — Release Gate item #12 remains a manual / out-of-band step
-until the FIPS-tagged release cadence stabilizes.
+Every tag-push build of `build_branch.yaml` uploads a
+`release-evidence-<version>` GitHub Actions artifact containing, for each
+of `clickhouse-operator` and `metrics-exporter`:
+
+- `<bin>__<version>.digest.txt` — sha256 manifest-list digest.
+- `<bin>__<version>.sbom.spdx.json` — syft SPDX-JSON SBOM of the image.
+- `<bin>__<version>.manifest.json` — multi-arch image manifest.
+- `<bin>-build-metadata.json` — the `buildx --metadata-file` output,
+  including SBOM digests, provenance hashes, and per-platform image IDs.
+
+In addition to the side-channel files, an inline SBOM and a SLSA provenance
+attestation are attached to the image manifest itself via
+`docker buildx --sbom=true --provenance=mode=max`, so anyone pulling the
+image can inspect them directly without the GitHub Actions artifact. The
+same trio of files is also uploaded to the matching GitHub Release page
+via `gh release upload`, so customers without access to the Actions tab
+can still fetch evidence by release tag.
+
+#### How to verify
+
+Pull the live manifest digest and compare it to the archived value:
+
+```bash
+docker buildx imagetools inspect altinity/clickhouse-operator:0.27.1 \
+  --format '{{.Manifest.Digest}}'
+# should equal the contents of clickhouse-operator__0.27.1.digest.txt
+```
+
+Diff a freshly generated SBOM against the shipped one:
+
+```bash
+syft altinity/clickhouse-operator:0.27.1 -o spdx-json > /tmp/now.json
+diff <(jq -S . /tmp/now.json) \
+     <(jq -S . release-evidence/clickhouse-operator__0.27.1.sbom.spdx.json)
+```
+
+Inspect the in-image provenance attestation:
+
+```bash
+docker buildx imagetools inspect altinity/clickhouse-operator:0.27.1 \
+  --format '{{json .Provenance}}'
+```
+
+TestFlows e2e reports remain a separate stream: each `run_tests.yaml` run
+keeps its `testflows.*.log`, operator pod logs, and event snapshot as the
+ordinary workflow artifacts. They are not bundled into
+`release-evidence-<version>` because they are produced by a different
+workflow with a different cadence.
+
+#### What is still pending
+
+The pipeline does not yet cover two follow-ups that are commonly grouped
+with release evidence:
+
+- **Cosign signing (Sigstore keyless via OIDC)**: the workflow already
+  carries `id-token: write` permissions, but the actual `cosign sign`
+  invocation is a planned follow-up rather than a current release-gate.
+- **Reproducible builds**: `dev/go_build_universal.sh` passes `-trimpath`
+  and `-buildvcs=true`, which removes the obvious sources of variance,
+  but bit-identical multi-arch builds are not enforced as a release-gate.
+
+#### Retention
+
+GitHub Actions retains tag-build evidence artifacts for 365 days and
+master-push evidence for 30 days. Customers whose compliance window is
+longer should pull the artifacts soon after release and mirror them into
+their own evidence store; the GitHub Release attachments share the
+retention of the release itself and serve as the longer-lived copy.
+
+#### PR-time validation
+
+`.github/workflows/release_evidence_smoketest.yaml` runs on every pull
+request that touches an evidence-relevant input (Dockerfiles, build
+scripts under `dev/`, and the release orchestrator). It exercises the
+digest, SBOM, manifest, and metadata steps end-to-end so the pipeline
+cannot silently regress between releases.
 
 ## Related
 

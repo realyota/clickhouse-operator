@@ -191,9 +191,8 @@ USER nobody
 # compatible certificate chains. Non-security SHA-1/MD5 usage in deterministic
 # identifier hashing (pkg/util/{hash,string,shell}.go) is permitted under this
 # mode — see docs/security_hardening.md and docs/fips.md §3 (these sites are
-# explicitly outside the cryptographic boundary). A separate `:<version>-fips`
-# image variant ships with `GODEBUG=fips140=only` for customers who want the
-# strict runtime as defense-in-depth.
+# explicitly outside the cryptographic boundary). This is the shipped default
+# runtime mode for the operator image; no other variant is published.
 ENV GODEBUG=fips140=on
 
 # Run /clickhouse-operator -alsologtostderr=true -v=1

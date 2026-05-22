@@ -428,8 +428,9 @@ type OperatorConfigSecurityImages struct {
 // OperatorConfigSecurityFIPS controls FIPS cryptographic-module enforcement.
 // Orthogonal to security.policy (which governs transport hardening). When
 // Enforced is true, the operator Fatals at startup unless the binary was
-// built with GOFIPS140 and crypto/fips140 reports Enabled (and Enforced()
-// for the strict :VERSION-fips image variant).
+// built with GOFIPS140 and crypto/fips140 reports Enabled. Strict-runtime
+// disagreement (GODEBUG=fips140=only set, chopconf disabled) produces a
+// startup Warning, not a Fatal — see EvaluateGate.
 type OperatorConfigSecurityFIPS struct {
 	Enforced *types.StringBool `json:"enforced,omitempty" yaml:"enforced,omitempty"`
 }

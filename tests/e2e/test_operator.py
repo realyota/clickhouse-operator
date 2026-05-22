@@ -7087,11 +7087,9 @@ def test_010076(self):
     Runtime mode is `GODEBUG=fips140=on` in the default image (filters TLS,
     cipher suites, sig algs, key exchanges) — `runtime.enforced=false` is the
     expected value here because `Enforced()` only reports `true` under the
-    stricter `fips140=only`. The separate `:<version>-fips` opt-in image
-    variant ships with `GODEBUG=fips140=only`; a dedicated test covers that
-    variant. Non-security SHA-1/MD5 hashing in `pkg/util/{hash,string,shell}.go`
-    is intentional and outside the FIPS cryptographic boundary per
-    `docs/fips.md` §3.
+    stricter `fips140=only`, which is not the shipped default. Non-security
+    SHA-1/MD5 hashing in `pkg/util/{hash,string,shell}.go` is intentional and
+    outside the FIPS cryptographic boundary per `docs/security_hardening.md` §3.
 
     Build linkage is driven by `dev/go_build_config.sh` defaulting GOFIPS140
     to v1.0.0 and propagated by every image-build entrypoint (CI, dev-image,

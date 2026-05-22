@@ -5,6 +5,12 @@ on:
     branches:
       - "[0-9]+.[0-9]+.[0-9]+"
 
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+  attestations: write
+
 jobs:
   build_version:
     name: Build branch
@@ -27,5 +33,29 @@ jobs:
           export GOFIPS140=v1.0.0
 
           echo "${DOCKER_PASS}" | docker login -u $DOCKER_USER --password-stdin docker.io
-          docker buildx build --progress plain --platform=linux/amd64,linux/arm64 -f dockerfile/operator/Dockerfile         --build-arg GO_VERSION=${GO_VERSION} --build-arg GOFIPS140=${GOFIPS140} -t docker.io/${DOCKER_ORG}/clickhouse-operator:${CHO_RELEASE} --pull --push .
-          docker buildx build --progress plain --platform=linux/amd64,linux/arm64 -f dockerfile/metrics-exporter/Dockerfile --build-arg GO_VERSION=${GO_VERSION} --build-arg GOFIPS140=${GOFIPS140} -t docker.io/${DOCKER_ORG}/metrics-exporter:${CHO_RELEASE}    --pull --push .
+          echo "Building operator image with SBOM + provenance + metadata capture"
+          docker buildx build --progress plain --platform=linux/amd64,linux/arm64 -f dockerfile/operator/Dockerfile         --build-arg GO_VERSION=${GO_VERSION} --build-arg GOFIPS140=${GOFIPS140} -t docker.io/${DOCKER_ORG}/clickhouse-operator:${CHO_RELEASE} --sbom=true --provenance=mode=max --metadata-file operator-build-metadata.json          --pull --push .
+          echo "Building metrics-exporter image with SBOM + provenance + metadata capture"
+          docker buildx build --progress plain --platform=linux/amd64,linux/arm64 -f dockerfile/metrics-exporter/Dockerfile --build-arg GO_VERSION=${GO_VERSION} --build-arg GOFIPS140=${GOFIPS140} -t docker.io/${DOCKER_ORG}/metrics-exporter:${CHO_RELEASE}    --sbom=true --provenance=mode=max --metadata-file metrics-exporter-build-metadata.json --pull --push .
+      - name: Capture release evidence
+        env:
+          DOCKER_ORG: ${{ secrets.DOCKER_ORG }}
+        run: |
+          export CHO_RELEASE=$(cat release)
+          echo "Collecting build metadata + digest + SBOM + provenance into release-evidence/"
+          mkdir -p release-evidence
+          cp operator-build-metadata.json metrics-exporter-build-metadata.json release-evidence/
+          ./dev/release_evidence.sh docker.io/${DOCKER_ORG}/clickhouse-operator:${CHO_RELEASE} release-evidence/
+          ./dev/release_evidence.sh docker.io/${DOCKER_ORG}/metrics-exporter:${CHO_RELEASE} release-evidence/
+      - name: Upload release evidence artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-${{ github.ref_name }}
+          path: release-evidence/
+          retention-days: 365
+      - name: Attach evidence to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Attempting to attach release-evidence artifacts to GH Release ${{ github.ref_name }}"
+          gh release upload ${{ github.ref_name }} release-evidence/*.{digest.txt,sbom.spdx.json,manifest.json,metadata.json} --clobber || echo "no release object yet"

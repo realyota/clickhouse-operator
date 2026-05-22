@@ -189,8 +189,10 @@ USER nobody
 # FIPS-compatible crypto at runtime (paired with GOFIPS140 build-time linking).
 # `fips140=on` is the default mode for GOFIPS140-built binaries: filters TLS
 # versions, cipher suites, signature algorithms, key exchanges, and FIPS-
-# compatible certificate chains. See dockerfile/operator/Dockerfile and
-# docs/security_hardening.md for the full rationale.
+# compatible certificate chains. This is the shipped default runtime mode for
+# the metrics-exporter image; no other variant is published. See
+# dockerfile/operator/Dockerfile and docs/security_hardening.md for the full
+# rationale.
 ENV GODEBUG=fips140=on
 
 # Run /metrics-exporter -alsologtostderr=true -v=1

@@ -10,6 +10,9 @@ DOCKERHUB_LOGIN="${DOCKERHUB_LOGIN}"
 DOCKERHUB_PUBLISH="${DOCKERHUB_PUBLISH:-"no"}"
 MINIKUBE="${MINIKUBE:-"no"}"
 MINIKUBE_PLATFORM="${MINIKUBE_PLATFORM:-""}"
+# Opt-in local release-evidence capture (SBOM, provenance, metadata + release_evidence.sh).
+# Default off to keep minikube/dev rebuilds fast.
+EVIDENCE="${EVIDENCE:-no}"
 
 # Source-dependent options
 CUR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
@@ -185,6 +188,22 @@ if [[ "${DOCKERHUB_PUBLISH}" == "yes" ]]; then
     DOCKER_CMD="${DOCKER_CMD} --push"
 fi
 
+# Append release-evidence build flags only when explicitly requested AND the build targets a real registry.
+# Registry-less local builds (MINIKUBE=yes or :dev tag) have no remote digest to attest, so skip.
+EVIDENCE_EFFECTIVE="no"
+if [[ "${EVIDENCE}" == "yes" ]]; then
+    if [[ "${MINIKUBE}" == "yes" ]]; then
+        echo "EVIDENCE=yes ignored: MINIKUBE=yes builds are registry-less (no remote digest to attest)." >&2
+    elif [[ "${DOCKER_IMAGE}" =~ :dev ]]; then
+        echo "EVIDENCE=yes ignored: DOCKER_IMAGE=${DOCKER_IMAGE} is a registry-less local dev tag." >&2
+    elif [[ "${DOCKERHUB_PUBLISH}" != "yes" ]]; then
+        echo "WARNING: EVIDENCE=yes requires DOCKERHUB_PUBLISH=yes; evidence capture needs a registry-pushed image. Skipping." >&2
+    else
+        EVIDENCE_EFFECTIVE="yes"
+        DOCKER_CMD="${DOCKER_CMD} --sbom=true --provenance=mode=max --metadata-file ${BIN_NAME:-image}-build-metadata.json"
+    fi
+fi
+
 # Append tag, dockerfile and SRC_ROOT
 DOCKER_CMD="${DOCKER_CMD} --tag ${DOCKER_IMAGE} --file ${DOCKERFILE} ${SRC_ROOT}"
 
@@ -208,4 +227,13 @@ else
     echo "Docker image build has failed."
     echo "Abort"
     exit 1
+fi
+
+# Capture release evidence (SBOM/provenance/metadata) for the registry-pushed image.
+# Gated by EVIDENCE_EFFECTIVE=yes set above; this branch is dead for default callers.
+if [[ "${EVIDENCE_EFFECTIVE}" == "yes" ]]; then
+    echo "EVIDENCE=yes: capturing release evidence for ${DOCKER_IMAGE} into ${EVIDENCE_DIR:-./release-evidence}"
+    mkdir -p "${EVIDENCE_DIR:-./release-evidence}"
+    cp "${BIN_NAME:-image}-build-metadata.json" "${EVIDENCE_DIR:-./release-evidence}/"
+    "${CUR_DIR}/release_evidence.sh" "${DOCKER_IMAGE}" "${EVIDENCE_DIR:-./release-evidence}"
 fi

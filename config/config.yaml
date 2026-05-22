@@ -354,9 +354,12 @@ security:
   # cryptographic-module enforcement.
   policy: Permissive
   # FIPS cryptographic-module enforcement. Orthogonal to security.policy.
-  # When true, the operator Fatals at startup unless the binary was built
-  # with GOFIPS140 and crypto/fips140 reports Enabled (and Enforced() for
-  # the strict :VERSION-fips image variant which runs with GODEBUG=fips140=only).
+  # Default operator and metrics-exporter images are FIPS-compatible —
+  # built with GOFIPS140=v1.0.0 and run with GODEBUG=fips140=on, so
+  # crypto/fips140.Enabled() returns true at runtime.
+  # When enforced=true, the operator Fatals at startup unless the binary
+  # reports crypto/fips140 Enabled — guards against accidentally running
+  # a non-FIPS rebuild in a hardened deployment.
   fips:
     enforced: false
   images:

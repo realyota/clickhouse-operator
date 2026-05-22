@@ -15,6 +15,10 @@
 package util
 
 import (
+	// #nosec G505 — non-security deterministic ID hashing; see
+	// BuildShellEnvVarName. The operator's FIPS scope specification (§3)
+	// excludes shell env-var suffix generation from the FIPS cryptographic
+	// boundary.
 	"crypto/md5"
 	"encoding/hex"
 	"regexp"
@@ -56,7 +60,9 @@ func BuildShellEnvVarName(str string) (name string, ok bool) {
 	if len(name) > shellEnvVarNameBaseMaxLength {
 		// Cut the name
 		name = name[0:shellEnvVarNameBaseMaxLength]
-		// Prepare fixed length suffix out of original string
+		// Non-cryptographic uniqueness suffix — 16-byte MD5 keeps the name
+		// total within shellEnvVarNameFullMaxLength.
+		// #nosec G401 — non-security deterministic ID hashing.
 		hash := md5.Sum([]byte(str))
 		suffix = "_" + strings.ToUpper(hex.EncodeToString(hash[:]))
 	}

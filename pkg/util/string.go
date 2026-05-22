@@ -15,9 +15,9 @@
 package util
 
 import (
-	// #nosec
-	// G505 (CWE-327): Blocklisted import crypto/sha1: weak cryptographic primitive
-	// It is good enough for string ID
+	// #nosec G505 — non-security deterministic ID hashing; see CreateStringID
+	// doc-comment. The operator's FIPS scope specification (§3) explicitly
+	// excludes this site from the FIPS cryptographic boundary.
 	"crypto/sha1"
 	"encoding/hex"
 	"math/rand"
@@ -45,12 +45,12 @@ func RandStringRange(minLength, maxLength int) string {
 	return RandString(rand.Intn(maxLength-minLength+1) + minLength)
 }
 
-// CreateStringID creates HEX hash ID out of a string.
-// In case maxHashLen == 0 the whole hash is returned
+// CreateStringID creates a HEX hash ID out of a string. Non-cryptographic
+// deterministic identifier; outside the FIPS cryptographic boundary per the
+// operator's FIPS scope.
+// In case maxHashLen == 0 the whole hash is returned.
 func CreateStringID(str string, maxHashLen int) string {
-	// #nosec
-	// G401 (CWE-326): Use of weak cryptographic primitive
-	// It is good enough for string ID
+	// #nosec G401 — non-security deterministic ID hashing.
 	sha := sha1.New()
 	sha.Write([]byte(str))
 	hash := hex.EncodeToString(sha.Sum(nil))

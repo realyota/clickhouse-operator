@@ -171,6 +171,10 @@ fi
 # Append VERSION and RELEASE
 DOCKER_CMD="${DOCKER_CMD} --build-arg VERSION=${VERSION:-dev} --build-arg GO_VERSION=${GO_VERSION}"
 
+# Append GOFIPS140 build arg (sourced from go_build_config.sh, defaults to v1.0.0).
+# Pass empty string explicitly to disable FIPS for non-FIPS-target images.
+DOCKER_CMD="${DOCKER_CMD} --build-arg GOFIPS140=${GOFIPS140}"
+
 # Append GC flags if present
 if [[ ! -z "${GCFLAGS}" ]]; then
     DOCKER_CMD="${DOCKER_CMD} --build-arg GCFLAGS='${GCFLAGS}'"

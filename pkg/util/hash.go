@@ -16,9 +16,9 @@ package util
 
 import (
 	"bytes"
-	// #nosec
-	// G505 (CWE-327): Blocklisted import crypto/sha1: weak cryptographic primitive
-	// It is good enough for string ID
+	// #nosec G505 — non-security deterministic ID hashing; see HashIntoString
+	// doc-comment. The operator's FIPS scope specification (§3) explicitly
+	// excludes this site from the FIPS cryptographic boundary.
 	"crypto/sha1"
 	"encoding/gob"
 	"encoding/hex"
@@ -26,7 +26,6 @@ import (
 	"hash/fnv"
 
 	dumper "github.com/sanity-io/litter"
-	//	"github.com/davecgh/go-spew/spew"
 )
 
 func serializeUnrepeatable(obj interface{}) []byte {
@@ -41,22 +40,26 @@ func serializeUnrepeatable(obj interface{}) []byte {
 }
 
 func serializeRepeatable(obj interface{}) []byte {
-	//s := spew.NewDefaultConfig()
-	//s.SortKeys = true
 	d := dumper.Options{
 		Separator: " ",
 	}
 	return []byte(d.Sdump(obj))
 }
 
-// HashIntoString hashes bytes and returns string version of the hash
+// HashIntoString returns a deterministic 40-char hex digest used as a
+// non-cryptographic object fingerprint / K8s label value (see Fingerprint and
+// labeler.MakeObjectVersion). NOT a security control: the digest is only used
+// to compare two serialized object representations for equality. Documented as
+// outside the FIPS cryptographic boundary per the operator's FIPS scope (no
+// integrity, signing, or authentication use). The Go runtime's `fips140=on`
+// (default for GOFIPS140-built binaries) permits SHA-1 in non-approved paths;
+// `fips140=only` (opt-in strict mode) would forbid it — operators running the
+// optional strict-mode image variant must take that into account.
 func HashIntoString(b []byte) string {
 	if len(b) == 0 {
 		return ""
 	}
-	// #nosec
-	// G401 (CWE-326): Use of weak cryptographic primitive
-	// It is good enough for string ID
+	// #nosec G401 — non-security deterministic ID hashing.
 	hasher := sha1.New()
 	hasher.Write(b)
 	return hex.EncodeToString(hasher.Sum(nil))

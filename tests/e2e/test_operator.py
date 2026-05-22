@@ -4842,16 +4842,13 @@ def test_043(self, manifest):
             )
 
     with Then("I check both containers are ready"):
-        assert kubectl.get_field(
-            kind="pod",
-            name=f"chi-{chi}-{cluster}-0-0-0",
-            field=".status.containerStatuses[0].ready"
-        ) == "true", error()
-        assert kubectl.get_field(
-            kind="pod",
-            name=f"chi-{chi}-{cluster}-0-0-0",
-            field=".status.containerStatuses[1].ready"
-        ) == "true", error()
+        # Auto-injected clickhouse-log sidecar (alphabetically containerStatuses[0])
+        # has no readinessProbe and may flip ready after CHI status=Completed,
+        # so poll instead of asserting once. Mirrors the wait_field readiness
+        # pattern used by test_044 in this file.
+        pod = f"chi-{chi}-{cluster}-0-0-0"
+        kubectl.wait_field("pod", pod, ".status.containerStatuses[0].ready", "true")
+        kubectl.wait_field("pod", pod, ".status.containerStatuses[1].ready", "true")
 
     with Then("I check clickhouse logs are in clickhouse-log container"):
         with By("calling ls inside clickhouse-log in /var/log directory"):
@@ -6987,7 +6984,7 @@ def test_010073(self):
 @Name("test_010074. FIPS image policy Required: non-fips CHI is rejected at admission with FIPSImagePolicyViolation reason")
 @Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
 def test_010074(self):
-    """Activate security.fips.images.policy=Required at the operator level
+    """Activate security.images.policy=Required at the operator level
     and apply a CHI whose resolved ClickHouse image lacks the "fips" tag
     substring. The operator's admission gate must:
 
@@ -6995,8 +6992,8 @@ def test_010074(self):
       2. Set status=Aborted with `[FIPSImagePolicyViolation]` leading the
          error stream — auto-recovery skip relies on the prefix.
 
-    Image policy is orthogonal to fips.enforced (master TLS switch); this
-    test isolates the image-policy branch by leaving fips.enforced unset.
+    Image policy is orthogonal to security.policy (master TLS switch); this
+    test isolates the image-policy branch by leaving security.policy unset.
     Recovery is via spec edit (informer UpdateFunc on next `kubectl apply`),
     not via the auto-recovery onPodReady path — pods never exist.
     """
@@ -7067,6 +7064,173 @@ def test_010075(self):
             assert "FIPSImagePolicyViolation" not in errors, error(
                 f"unexpected FIPSImagePolicyViolation in status.errors, got {errors}"
             )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_010076. FIPS posture: default operator image is FIPS-built")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_010076(self):
+    """Pin the operator-wide FIPS posture as a release-gate invariant.
+
+    The operator emits a single banner at startup of the form
+        FIPS: chopconf.fips.enforced=<bool> build.enabled=<bool> runtime.enforced=<bool> module=<ver>
+
+    Regardless of `security.fips.enforced` in chopconf (FIPS cryptographic-
+    module gate — opt-in), the shipped default image MUST be GOFIPS140-built
+    so the Go FIPS crypto module is linked (`build.enabled=true`). A regression
+    that drops GOFIPS140 silently downgrades FIPS strength across the whole
+    fleet, so we fail the e2e run rather than let it slip through.
+
+    Runtime mode is `GODEBUG=fips140=on` in the default image (filters TLS,
+    cipher suites, sig algs, key exchanges) — `runtime.enforced=false` is the
+    expected value here because `Enforced()` only reports `true` under the
+    stricter `fips140=only`. The separate `:<version>-fips` opt-in image
+    variant ships with `GODEBUG=fips140=only`; a dedicated test covers that
+    variant. Non-security SHA-1/MD5 hashing in `pkg/util/{hash,string,shell}.go`
+    is intentional and outside the FIPS cryptographic boundary per
+    `docs/fips.md` §3.
+
+    Build linkage is driven by `dev/go_build_config.sh` defaulting GOFIPS140
+    to v1.0.0 and propagated by every image-build entrypoint (CI, dev-image,
+    Vagrant, devspace).
+    """
+    create_shell_namespace_clickhouse_template()
+    operator_namespace = current().context.operator_namespace
+
+    with Given("Operator pod is running the default install"):
+        operator_pod = kubectl.get_operator_pod(ns=operator_namespace)
+        assert operator_pod != "", error("operator pod not found")
+
+    # Release-gate invariant covers BOTH binaries shipped from the operator
+    # pod: clickhouse-operator AND metrics-exporter. The two are built from
+    # the same Go module under the same GOFIPS140 build flag, but they are
+    # distinct images with separate image-build entrypoints — a regression
+    # that drops the build tag from one image will not necessarily drop it
+    # from the other. Assert the banner symmetrically against both
+    # containers so future regressions in either binary fail this gate.
+    banner_pattern = (
+        r"FIPS: chopconf\.fips\.enforced=(true|false) "
+        r"build\.enabled=(true|false) "
+        r"runtime\.enforced=(true|false) "
+        r"module=\S+"
+    )
+
+    with When("Read the operator startup banner"):
+        op_logs = kubectl.launch(
+            f"logs {operator_pod} -c clickhouse-operator --tail=400",
+            ns=operator_namespace,
+        )
+
+    with Then("Banner is present and reports FIPS-built (build.enabled=true)"):
+        m = re.search(banner_pattern, op_logs)
+        assert m is not None, error(
+            "FIPS startup banner not found in operator logs (tail=400) — "
+            "operator may be from a pre-FIPS-gate image"
+        )
+        build_enabled = m.group(2)
+        assert build_enabled == "true", error(
+            f"operator image is NOT FIPS-built: build.enabled={build_enabled} "
+            f"(expected true — GOFIPS140 build tag missing)"
+        )
+
+    with When("Read the metrics-exporter startup banner"):
+        exporter_logs = kubectl.launch(
+            f"logs {operator_pod} -c metrics-exporter --tail=400",
+            ns=operator_namespace,
+        )
+
+    with Then("Banner is present and reports FIPS-built (build.enabled=true) for metrics-exporter"):
+        m = re.search(banner_pattern, exporter_logs)
+        assert m is not None, error(
+            "FIPS startup banner not found in metrics-exporter logs (tail=400) — "
+            "exporter image may be from a pre-FIPS-gate build"
+        )
+        build_enabled = m.group(2)
+        assert build_enabled == "true", error(
+            f"metrics-exporter image is NOT FIPS-built: build.enabled={build_enabled} "
+            f"(expected true — GOFIPS140 build tag missing from exporter image)"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_010077. FIPS on-wire TLS verification: Strict + wrong rootCA fails ClickHouse fetch")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_010077(self):
+    """Exercise the FIPS-built TLS stack on the wire and prove it actually
+    verifies peer certs rather than silently falling back to
+    InsecureSkipVerify=true.
+
+    The release gate for FIPS asks for "e2e test using the FIPS operator
+    image with verified TLS". Banner-only tests (test_010076) confirm the
+    binary is built against the Go FIPS module, but they cannot detect a
+    silent code-path regression that bypasses the verifying TLS dialer.
+    This test closes that gap with a NEGATIVE roundtrip:
+
+      1. Deploy a ClickHouse with a self-signed cert (reusing the test-058
+         server cert + key + CA secret).
+      2. Configure the operator with `security.clickhouse.tls.verify=Strict`
+         and an inline `rootCA` that is NOT the issuer of the server cert
+         (self-signed CA CN=test-077-unrelated-ca.example, generated
+         specifically for this test — guarantees chain validation fails).
+      3. Assert `chi_clickhouse_metric_fetch_errors == 1`: the operator's
+         outbound TLS handshake must fail cert verification and the metric
+         exporter must surface it.
+
+    A positive roundtrip would require provisioning a server cert signed by
+    a CA whose PEM is reproducible across runs; the negative roundtrip
+    exercises the same `crypto/tls` code path under FIPS without that
+    infrastructure burden, while still failing loudly if a future change
+    re-introduces InsecureSkipVerify=true on the strict path.
+    """
+    create_shell_namespace_clickhouse_template()
+    operator_namespace = current().context.operator_namespace
+
+    with Given("test-058-root-ca secret is installed (reused for server cert/key/CA)"):
+        kubectl.apply(
+            util.get_full_path("manifests/secret/test-058-secret.yaml"),
+        )
+
+    chi_manifest = "manifests/chi/test-077-fips-tls-wrong-ca.yaml"
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+
+    with When("Create the CHI with HTTPS-enabled ClickHouse"):
+        kubectl.create_and_check(
+            manifest=chi_manifest,
+            check={
+                "apply_templates": {
+                    current().context.clickhouse_template,
+                },
+                "object_counts": {"statefulset": 1, "pod": 1, "service": 2},
+                "do_not_delete": 1,
+            },
+        )
+
+    chopconf_file = "manifests/chopconf/test-077-fips-tls-wrong-ca-chopconf.yaml"
+    with When("Apply chopconf with verify=Strict and a deliberately wrong rootCA"):
+        util.apply_operator_config(chopconf_file)
+        kubectl.wait_chi_status(chi, "Completed")
+
+    with Then("chi_clickhouse_metric_fetch_errors is 1 — TLS handshake rejected"):
+        # Negative assertion: the strict-verify path must refuse the server
+        # cert (issuer != configured rootCA). If this metric reports 0, the
+        # operator silently downgraded to InsecureSkipVerify=true — exactly
+        # the regression this test guards against. Pin the chi label so a
+        # stray fetch_errors=1 on an unrelated CHI cannot satisfy the assertion.
+        check_metrics_monitoring(
+            operator_namespace=operator_namespace,
+            operator_pod=kubectl.get_operator_pod(),
+            expect_pattern=f'^chi_clickhouse_metric_fetch_errors{{[^}}]*chi="{chi}"[^}}]*}} 1$',
+        )
+
+    with When("Reset ClickHouseOperatorConfiguration to default"):
+        kubectl.delete(util.get_full_path(chopconf_file, lookup_in_host=False), operator_namespace)
+        util.restart_operator()
 
     with Finally("I clean up"):
         delete_test_namespace()

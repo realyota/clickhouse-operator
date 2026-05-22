@@ -5214,7 +5214,6 @@ metadata:
   namespace: kube-system
   labels:
     clickhouse.altinity.com/chop: 0.27.1
-
 # Template Parameters:
 #
 # NAMESPACE=kube-system
@@ -5467,7 +5466,6 @@ subjects:
   - kind: ServiceAccount
     name: clickhouse-operator
     namespace: kube-system
-
 # Template Parameters:
 #
 # NAMESPACE=kube-system
@@ -6950,21 +6948,25 @@ spec:
                 resourceFieldRef:
                   containerName: clickhouse-operator
                   resource: requests.cpu
+                  divisor: "1m"
             - name: OPERATOR_CONTAINER_CPU_LIMIT
               valueFrom:
                 resourceFieldRef:
                   containerName: clickhouse-operator
                   resource: limits.cpu
+                  divisor: "1m"
             - name: OPERATOR_CONTAINER_MEM_REQUEST
               valueFrom:
                 resourceFieldRef:
                   containerName: clickhouse-operator
                   resource: requests.memory
+                  divisor: "1Mi"
             - name: OPERATOR_CONTAINER_MEM_LIMIT
               valueFrom:
                 resourceFieldRef:
                   containerName: clickhouse-operator
                   resource: limits.memory
+                  divisor: "1Mi"
           ports:
             - containerPort: 9999
               name: op-metrics
@@ -7026,21 +7028,25 @@ spec:
                 resourceFieldRef:
                   containerName: clickhouse-operator
                   resource: requests.cpu
+                  divisor: "1m"
             - name: OPERATOR_CONTAINER_CPU_LIMIT
               valueFrom:
                 resourceFieldRef:
                   containerName: clickhouse-operator
                   resource: limits.cpu
+                  divisor: "1m"
             - name: OPERATOR_CONTAINER_MEM_REQUEST
               valueFrom:
                 resourceFieldRef:
                   containerName: clickhouse-operator
                   resource: requests.memory
+                  divisor: "1Mi"
             - name: OPERATOR_CONTAINER_MEM_LIMIT
               valueFrom:
                 resourceFieldRef:
                   containerName: clickhouse-operator
                   resource: limits.memory
+                  divisor: "1Mi"
           ports:
             - containerPort: 8888
               name: ch-metrics

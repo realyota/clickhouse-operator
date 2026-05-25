@@ -35,3 +35,50 @@ func TestRuntime_Stubbable(t *testing.T) {
 		require.Equal(t, !want, Enforced(), "Enforced stub")
 	}
 }
+
+// TestGODEBUGRaw_ReadsEnv confirms the helper returns the GODEBUG env var
+// verbatim, including multi-key payloads and empty after unset.
+func TestGODEBUGRaw_ReadsEnv(t *testing.T) {
+	const payload = "fips140=on,other=foo"
+	t.Setenv("GODEBUG", payload)
+	require.Equal(t, payload, GODEBUGRaw(), "GODEBUGRaw should mirror env verbatim")
+
+	t.Setenv("GODEBUG", "")
+	require.Equal(t, "", GODEBUGRaw(), "GODEBUGRaw should be empty after unset")
+}
+
+// TestGODEBUGRaw_EmptyWhenUnset asserts the empty-env case explicitly so
+// the banner code can rely on "" meaning "GODEBUG not set".
+func TestGODEBUGRaw_EmptyWhenUnset(t *testing.T) {
+	t.Setenv("GODEBUG", "")
+	require.Equal(t, "", GODEBUGRaw())
+}
+
+// TestBuildSetting_ReturnsExistingKey uses GOOS because every Go binary
+// (including the test binary) has a GOOS build setting populated by the
+// toolchain via runtime/debug.ReadBuildInfo().
+func TestBuildSetting_ReturnsExistingKey(t *testing.T) {
+	require.NotEmpty(t, BuildSetting("GOOS"), "GOOS build setting must be populated for any Go binary")
+}
+
+// TestBuildSetting_EmptyForUnknownKey confirms the absent-key contract —
+// banner code uses "" as the "setting not present" signal.
+func TestBuildSetting_EmptyForUnknownKey(t *testing.T) {
+	require.Equal(t, "", BuildSetting("NotARealSetting"))
+}
+
+// TestBuildSetting_GOFIPS140 is diagnostic only: the test toolchain may or
+// may not stamp GOFIPS140 depending on how `go test` was invoked. Logging
+// the value helps debug FIPS banner output across different test environments.
+func TestBuildSetting_GOFIPS140(t *testing.T) {
+	t.Logf("GOFIPS140 build setting = %q", BuildSetting("GOFIPS140"))
+}
+
+// TestGODEBUGRaw_Mockable confirms the `var func` indirection pattern allows
+// tests to swap the helper out for a stub — same seam as Enabled/Enforced.
+func TestGODEBUGRaw_Mockable(t *testing.T) {
+	orig := GODEBUGRaw
+	defer func() { GODEBUGRaw = orig }()
+	GODEBUGRaw = func() string { return "test-injected" }
+	require.Equal(t, "test-injected", GODEBUGRaw())
+}

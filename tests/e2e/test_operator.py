@@ -6499,23 +6499,50 @@ def test_010066(self):
             },
         )
 
+    def _cluster_tls_field(cluster_name, leaf):
+        # Helper: pull a single per-cluster .security.clickhouse.tls.<leaf>
+        # value out of the live CHI via jsonpath. Mirrors the inline jsonpath
+        # idiom already used in this test for `verify`.
+        return kubectl.launch(
+            f"get chi {chi} -o jsonpath="
+            f"'{{.spec.configuration.clusters[?(@.name==\"{cluster_name}\")]"
+            f".security.clickhouse.tls.{leaf}}}'"
+        ).strip().strip("'")
+
     with Then("Each cluster preserves its own security.clickhouse.tls knobs after normalize"):
         # Cluster-level security in the spec persists through reconcile; this
         # exercises the same MergeFrom-fill-empty path that future refactors
         # could regress.
-        strict_verify = kubectl.launch(
-            f"get chi {chi} -o jsonpath="
-            f"'{{.spec.configuration.clusters[?(@.name==\"strict-cluster\")].security.clickhouse.tls.verify}}'"
-        ).strip().strip("'")
+        strict_verify = _cluster_tls_field("strict-cluster", "verify")
         assert strict_verify == "Strict", error(
             f"strict-cluster.security.clickhouse.tls.verify expected 'Strict', got {strict_verify!r}"
         )
-        lax_verify = kubectl.launch(
-            f"get chi {chi} -o jsonpath="
-            f"'{{.spec.configuration.clusters[?(@.name==\"lax-cluster\")].security.clickhouse.tls.verify}}'"
-        ).strip().strip("'")
+        lax_verify = _cluster_tls_field("lax-cluster", "verify")
         assert lax_verify == "None", error(
             f"lax-cluster.security.clickhouse.tls.verify expected 'None', got {lax_verify!r}"
+        )
+
+    with And("Each cluster's minVersion + serverName survive normalize (per-cluster overlay)"):
+        # If the per-cluster overlay path regresses to MergeFrom-copy instead
+        # of MergeFrom-fill-empty, an empty leaf on one cluster would clobber
+        # the other cluster's value. Assert each leaf independently.
+        strict_min = _cluster_tls_field("strict-cluster", "minVersion")
+        assert strict_min == "1.3", error(
+            f"strict-cluster.security.clickhouse.tls.minVersion expected '1.3', got {strict_min!r}"
+        )
+        lax_min = _cluster_tls_field("lax-cluster", "minVersion")
+        assert lax_min == "1.2", error(
+            f"lax-cluster.security.clickhouse.tls.minVersion expected '1.2', got {lax_min!r}"
+        )
+        strict_sni = _cluster_tls_field("strict-cluster", "serverName")
+        assert strict_sni == "strict.example", error(
+            f"strict-cluster.security.clickhouse.tls.serverName expected "
+            f"'strict.example', got {strict_sni!r}"
+        )
+        lax_sni = _cluster_tls_field("lax-cluster", "serverName")
+        assert lax_sni == "lax.example", error(
+            f"lax-cluster.security.clickhouse.tls.serverName expected "
+            f"'lax.example', got {lax_sni!r}"
         )
 
     with Finally("I clean up"):
@@ -6575,6 +6602,25 @@ def test_010067(self):
             f"override-verify cluster expected 'None', got {override!r}"
         )
 
+    with And("CHI spec.security.minVersion overrides chopconf's 1.2 → 1.3 (chopconf→CHI)"):
+        chi_min = kubectl.get_field("chi", chi, ".spec.security.clickhouse.tls.minVersion")
+        assert chi_min == "1.3", error(
+            f"CHI spec.security.clickhouse.tls.minVersion expected '1.3' "
+            f"(CHI-level override of chopconf 1.2), got {chi_min!r}"
+        )
+
+    # NOTE: CHI→cluster Security fill-empty inheritance is normalize-only —
+    # for a cluster that lacks an explicit security block (`inherit` cluster
+    # here), the resolved security values populated by MergeFrom-fill-empty
+    # live in `.status.normalizedCompleted`, NOT in `.spec.configuration.
+    # clusters[].security` on the persisted CHI. Similarly, a cluster that
+    # overrides only one field (`override-verify` here, which sets only
+    # verify) does not have inherited siblings (minVersion) written into its
+    # `.spec` cluster security block. The three assertions (inherit_verify,
+    # inherit_min, override_min) added in round 8 were factually incorrect
+    # about the persistence contract — same deferred audit as test_010069.
+    # See memory/deferred_chit_merge_persistence_audit.md.
+
     with Finally("I clean up"):
         delete_test_namespace()
 
@@ -6610,8 +6656,12 @@ def test_010068(self):
     with When("Re-apply the same manifest (no spec change)"):
         # kubectl apply with identical content should be a no-op for the STS.
         kubectl.apply(util.get_full_path(manifest))
-        # Give the operator a moment to re-normalize and check for drift.
-        time.sleep(10)
+        # Replace racy time.sleep(10) with an explicit wait for the
+        # operator's second reconcile pass to finish. With a bare sleep, if
+        # the operator hasn't yet started its 2nd reconcile when the sleep
+        # ends, the gen1==gen2 check is trivially satisfied and any
+        # generation-bumping drift in normalize is masked.
+        kubectl.wait_chi_status(chi, "Completed", retries=10)
 
     with Then("StatefulSet generation MUST be unchanged after re-apply"):
         gen2 = kubectl.get_field("sts", f"chi-{chi}-default-0-0", ".metadata.generation")
@@ -6662,6 +6712,14 @@ def test_010069(self):
         assert cluster_verify == "None", error(
             f"override cluster.security.clickhouse.tls.verify expected 'None', got {cluster_verify!r}"
         )
+
+    # NOTE: CHIT→CHI Security merge is normalize-only — the merged values
+    # are NOT written back to the CHI's persisted `.spec` on the API server,
+    # so we cannot assert them via `kubectl get` here. The cluster-level
+    # override above is the only externally observable invariant of this
+    # test. The persistence-model question (should CHIT merge land in
+    # `.spec` or only `.status.normalized`?) is deferred — see MEMORY.md
+    # note on the CHIT-merge persistence audit.
 
     with Finally("I clean up"):
         delete_test_namespace()
@@ -6963,7 +7021,7 @@ def test_010073(self):
         # Soft check: we only assert reconciler behavior below.
         _ = op_logs
 
-    with When("Apply CHI referencing plain-text external ZooKeeper"):
+    with When("Apply CHI referencing plain-text external ZooKeeper (missing `secure`)"):
         kubectl.apply(util.get_full_path(chi_manifest))
 
     with Then("CHI lands in status=Aborted"):
@@ -6974,6 +7032,29 @@ def test_010073(self):
         print(errors)
         assert "FIPSValidationFailed" in errors, error(
                 f"expected [FIPSValidationFailed] reason in status.errors, got {errors}"
+        )
+
+    # Sibling sub-assertion: the FIPS validator must reject not only the
+    # implicit `secure: <missing>` case (covered above) but also the
+    # *explicit* `secure: false` case. A naive validator that walks the spec
+    # tree with `if zkNode.Secure != nil && *zkNode.Secure == false: reject`
+    # has different code paths from the missing-field case and the two paths
+    # can drift; we exercise both. The explicit-false manifest is a sibling
+    # of the missing-secure manifest, differing only in that field.
+    chi_explicit_manifest = "manifests/chi/test-073-fips-zk-rejected-explicit-false.yaml"
+    chi_explicit = yaml_manifest.get_name(util.get_full_path(chi_explicit_manifest))
+    with When("Apply CHI with explicit `secure: false` on ZooKeeper nodes"):
+        kubectl.apply(util.get_full_path(chi_explicit_manifest))
+
+    with Then("Explicit-false CHI also lands in status=Aborted"):
+        kubectl.wait_chi_status(chi_explicit, 'Aborted')
+
+    with And("Aborted reason on explicit-false CHI is also [FIPSValidationFailed]"):
+        errors = kubectl.get_field('chi', chi_explicit, '.status.errors')
+        print(errors)
+        assert "FIPSValidationFailed" in errors, error(
+            f"expected [FIPSValidationFailed] reason in status.errors for "
+            f"explicit `secure: false` CHI, got {errors}"
         )
 
     with Finally("I clean up"):
@@ -7016,6 +7097,22 @@ def test_010074(self):
         errors = kubectl.get_field('chi', chi, '.status.errors')
         assert "FIPSImagePolicyViolation" in errors, error(
             f"expected [FIPSImagePolicyViolation] reason in status.errors, got {errors}"
+        )
+
+    with And("First error entry starts with the [FIPSImagePolicyViolation] prefix (contract)"):
+        # pkg/controller/chi/worker-pod-retry.go:36-39 distinguishes
+        # auto-recovery-eligible failures from terminal FIPS rejections by
+        # matching the LEADING `[FIPSImagePolicyViolation]` prefix on
+        # errors[0]. If a future refactor relocates the tag mid-string the
+        # auto-recovery skip stops working and pods spin-retry forever.
+        # `get_field` collapses list output into a whitespace-separated
+        # rendering; assert that the prefix sits at the head of the string.
+        stripped = errors.strip().lstrip("[").lstrip()
+        assert errors.strip().startswith("[FIPSImagePolicyViolation]") or \
+            stripped.startswith("FIPSImagePolicyViolation]"), error(
+            f"errors[0] must START with [FIPSImagePolicyViolation] prefix "
+            f"(auto-recovery contract in worker-pod-retry.go:36-39 depends on "
+            f"the leading bracket-tag); got: {errors!r}"
         )
 
     with And("No StatefulSet was created for the rejected CHI"):
@@ -7116,16 +7213,26 @@ def test_010076(self):
         r"module=\S+"
     )
 
+    # Use --tail=-1 (no cap): the FIPS banner lands at ~line 500-700 of the
+    # operator log because chop.Config().String(true) dumps ~500-700 lines of
+    # yaml before the banner is emitted. A bounded --tail value (e.g. 400)
+    # silently misses the banner on a freshly-restarted operator and the
+    # regex match falsely fails — the binary is FIPS-built but we never see
+    # the line we need to verify. -1 disables the kubectl-side cap.
+    fips_env_pattern = (
+        r'FIPS env: GODEBUG="[^"]*" DefaultGODEBUG="[^"]*" GOFIPS140="[^"]*"'
+    )
+
     with When("Read the operator startup banner"):
         op_logs = kubectl.launch(
-            f"logs {operator_pod} -c clickhouse-operator --tail=400",
+            f"logs {operator_pod} -c clickhouse-operator --tail=-1",
             ns=operator_namespace,
         )
 
     with Then("Banner is present and reports FIPS-built (build.enabled=true)"):
         m = re.search(banner_pattern, op_logs)
         assert m is not None, error(
-            "FIPS startup banner not found in operator logs (tail=400) — "
+            "FIPS startup banner not found in operator logs (tail=-1) — "
             "operator may be from a pre-FIPS-gate image"
         )
         build_enabled = m.group(2)
@@ -7134,16 +7241,28 @@ def test_010076(self):
             f"(expected true — GOFIPS140 build tag missing)"
         )
 
+    with And("FIPS env line is present (soft-fail: forward-compatible)"):
+        # Soft-fail with a warning rather than assert: A2's banner enhancement
+        # adds a second `FIPS env: GODEBUG=... DefaultGODEBUG=... GOFIPS140=...`
+        # line. If that enhancement has not landed in the image under test,
+        # the rest of the gate still holds. Use note() so the absence shows
+        # up in the test log without flipping the test red.
+        if re.search(fips_env_pattern, op_logs) is None:
+            note(
+                "FIPS env line not found in operator logs — A2 banner "
+                "enhancement may not be present yet (soft-fail, not an error)"
+            )
+
     with When("Read the metrics-exporter startup banner"):
         exporter_logs = kubectl.launch(
-            f"logs {operator_pod} -c metrics-exporter --tail=400",
+            f"logs {operator_pod} -c metrics-exporter --tail=-1",
             ns=operator_namespace,
         )
 
     with Then("Banner is present and reports FIPS-built (build.enabled=true) for metrics-exporter"):
         m = re.search(banner_pattern, exporter_logs)
         assert m is not None, error(
-            "FIPS startup banner not found in metrics-exporter logs (tail=400) — "
+            "FIPS startup banner not found in metrics-exporter logs (tail=-1) — "
             "exporter image may be from a pre-FIPS-gate build"
         )
         build_enabled = m.group(2)
@@ -7151,6 +7270,13 @@ def test_010076(self):
             f"metrics-exporter image is NOT FIPS-built: build.enabled={build_enabled} "
             f"(expected true — GOFIPS140 build tag missing from exporter image)"
         )
+
+    with And("FIPS env line is present in metrics-exporter logs (soft-fail)"):
+        if re.search(fips_env_pattern, exporter_logs) is None:
+            note(
+                "FIPS env line not found in metrics-exporter logs — A2 "
+                "banner enhancement may not be present yet (soft-fail, not an error)"
+            )
 
     with Finally("I clean up"):
         delete_test_namespace()
@@ -7229,6 +7355,57 @@ def test_010077(self):
     with When("Reset ClickHouseOperatorConfiguration to default"):
         kubectl.delete(util.get_full_path(chopconf_file, lookup_in_host=False), operator_namespace)
         util.restart_operator()
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_010078. FIPS Enforced: cluster-level verify=None on CHI is rejected with FIPSValidationFailed reason")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_010078(self):
+    """CHI counterpart of test_020009 (CHK) and a per-cluster sibling of
+    test_010073 (CHI/ZK). With `security.policy: Enforced` at the operator
+    level, a CHI whose .spec.configuration.clusters[].security.clickhouse.tls.verify
+    is explicitly set to None must be rejected at normalize time.
+
+    Where test_010073 covers the implicit-bypass route (plain-text ZK without
+    `secure: true`), this test covers the per-cluster explicit-bypass route:
+    the user opted into a Strict FIPS posture at the operator level and then
+    tried to escape it inside a single cluster. The validator must:
+
+      1. Set status=Aborted with [FIPSValidationFailed] in errors[0].
+      2. Refuse to create any StatefulSet for the rejected CHI (no half-
+         provisioned resources lying around requiring manual cleanup).
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chopconf_file = "manifests/chopconf/test-078-fips-verify-none-chopconf.yaml"
+    chi_manifest = "manifests/chi/test-078-fips-verify-none.yaml"
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+
+    with Given("Apply Enforced-policy FIPS chopconf and restart operator"):
+        util.apply_operator_config(chopconf_file)
+
+    with When("Apply CHI with cluster.security.clickhouse.tls.verify=None"):
+        kubectl.apply(util.get_full_path(chi_manifest))
+
+    with Then("CHI lands in status=Aborted"):
+        kubectl.wait_chi_status(chi, 'Aborted')
+
+    with And("Aborted reason is [FIPSValidationFailed]"):
+        errors = kubectl.get_field('chi', chi, '.status.errors')
+        print(errors)
+        assert "FIPSValidationFailed" in errors, error(
+            f"expected [FIPSValidationFailed] reason in status.errors, got {errors}"
+        )
+
+    with And("No StatefulSet was created for the rejected CHI"):
+        # The rejection must happen before any resource provisioning so
+        # there is nothing to clean up downstream. Matches the contract
+        # already enforced by test_010074 for the image-policy branch.
+        sts = kubectl.get_count('sts', label=f'clickhouse.altinity.com/chi={chi}')
+        assert sts == 0, error(f"expected no STS for aborted CHI, got {sts}")
 
     with Finally("I clean up"):
         delete_test_namespace()

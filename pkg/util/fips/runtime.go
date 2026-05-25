@@ -16,6 +16,8 @@ package fips
 
 import (
 	"crypto/fips140"
+	"os"
+	"runtime/debug"
 )
 
 // Indirection vars so tests can drive the gate down all matrix branches
@@ -26,3 +28,24 @@ var (
 	Enforced = fips140.Enforced
 	Version  = fips140.Version
 )
+
+// GODEBUGRaw returns the raw GODEBUG env var. Indirection seam so the FIPS
+// banner can distinguish GODEBUG unset from fips140=on (both produce identical
+// build.enabled=true runtime.enforced=false output otherwise).
+var GODEBUGRaw = func() string { return os.Getenv("GODEBUG") }
+
+// BuildSetting walks runtime/debug.ReadBuildInfo().Settings and returns the
+// value for the given key (or "" when ReadBuildInfo fails or key is absent).
+// Used to surface DefaultGODEBUG and GOFIPS140 in the FIPS banner.
+var BuildSetting = func(key string) string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	for _, s := range info.Settings {
+		if s.Key == key {
+			return s.Value
+		}
+	}
+	return ""
+}

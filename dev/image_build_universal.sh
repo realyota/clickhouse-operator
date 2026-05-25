@@ -6,7 +6,7 @@
 set -e
 DOCKERFILE="${DOCKERFILE_DIR}/Dockerfile"
 
-DOCKERHUB_LOGIN="${DOCKERHUB_LOGIN}"
+DOCKERHUB_LOGIN="${DOCKERHUB_LOGIN:-}"
 DOCKERHUB_PUBLISH="${DOCKERHUB_PUBLISH:-"no"}"
 MINIKUBE="${MINIKUBE:-"no"}"
 MINIKUBE_PLATFORM="${MINIKUBE_PLATFORM:-""}"
@@ -178,8 +178,9 @@ DOCKER_CMD="${DOCKER_CMD} --build-arg VERSION=${VERSION:-dev} --build-arg GO_VER
 # Pass empty string explicitly to disable FIPS for non-FIPS-target images.
 DOCKER_CMD="${DOCKER_CMD} --build-arg GOFIPS140=${GOFIPS140}"
 
-# Append GC flags if present
-if [[ ! -z "${GCFLAGS}" ]]; then
+# Append GC flags if present (default empty for set -u compat — GCFLAGS is
+# only set by callers building with debug/race instrumentation).
+if [[ -n "${GCFLAGS:-}" ]]; then
     DOCKER_CMD="${DOCKER_CMD} --build-arg GCFLAGS='${GCFLAGS}'"
 fi
 

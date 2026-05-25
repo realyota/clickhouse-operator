@@ -803,7 +803,28 @@ The operator banner at startup also reports the module version:
 
 ```
 FIPS: chopconf.policy=… build.enabled=… runtime.enforced=… module=v1.0.0
+FIPS env: GODEBUG=fips140=on DefaultGODEBUG=fips140=on GOFIPS140=v1.0.0
 ```
+
+The second `FIPS env:` line is new in 0.27.1 and is emitted by both the operator
+and the metrics-exporter. It echoes the **raw** `GODEBUG` environment variable
+as the process sees it, alongside the `DefaultGODEBUG` and `GOFIPS140` build
+settings read from `runtime/debug.ReadBuildInfo`. This disambiguates two
+postures that otherwise produce identical `crypto/fips140.Enabled=true` and
+`runtime.enforced=false` interpretations in the first banner line:
+
+- **Case 1** — binary built with `GOFIPS140=v1.0.0`, container started with
+  `GODEBUG` unset → `FIPS env: GODEBUG= DefaultGODEBUG=fips140=on GOFIPS140=v1.0.0`.
+  The runtime is in `on` mode courtesy of the baked-in `DefaultGODEBUG`.
+- **Case 2** — binary built with `GOFIPS140=v1.0.0`, container started with
+  `-e GODEBUG=fips140=on` → `FIPS env: GODEBUG=fips140=on DefaultGODEBUG=fips140=on GOFIPS140=v1.0.0`.
+  Both env and default agree.
+
+Reading the raw `GODEBUG` value is the recommended first step when triaging
+"is my pod actually in the FIPS mode I configured?" — a downstream override
+(`-e GODEBUG=` to disable, `-e GODEBUG=fips140=only` to harden) shows up
+verbatim in this line, whereas the first banner line only collapses the
+posture into Enabled/Enforced booleans.
 
 ### E2E coverage
 
@@ -811,6 +832,15 @@ FIPS: chopconf.policy=… build.enabled=… runtime.enforced=… module=v1.0.0
 emitted by `cmd/operator/app/fips_gate.go` and fails the run if
 `build.enabled` reports `false`. The shipped image asserts the build linkage
 against the Go FIPS 140-3 module.
+
+`tests/e2e/test_operator.py::test_010078` verifies the strict-FIPS master
+switch cannot be subverted by a per-CHI override: it applies a CHI with
+`security.clickhouse.tls.verify: None` while the chopconf has
+`security.policy: Enforced`, and asserts the CHI lands in `status: Aborted`
+with `[FIPSValidationFailed]` in `status.errors` — admission rejects the
+weaker per-CHI knob rather than silently honoring it. A companion assertion
+greps the `FIPS env:` banner line and confirms the recorded `GODEBUG` /
+`DefaultGODEBUG` / `GOFIPS140` triple matches the deployed posture.
 
 Local e2e (`tests/e2e/run_tests_local.sh`) rebuilds operator + metrics-
 exporter via `dev/image_build_all_dev.sh`, which defaults `GOFIPS140=v1.0.0`

@@ -33,6 +33,10 @@ func fipsGate() {
 	fipsEnforced := chop.Config().Security.GetFIPS().IsEnforced()
 	build, runtime := fips.Enabled(), fips.Enforced()
 	log.F().Info("FIPS: chopconf.fips.enforced=%t build.enabled=%t runtime.enforced=%t module=%s", fipsEnforced, build, runtime, fips.Version())
+	log.F().Info("FIPS env: GODEBUG=%q DefaultGODEBUG=%q GOFIPS140=%q",
+		fips.GODEBUGRaw(),
+		fips.BuildSetting("DefaultGODEBUG"),
+		fips.BuildSetting("GOFIPS140"))
 	err, warn := fips.EvaluateGate("metrics-exporter", fipsEnforced, build, runtime)
 	if err != nil {
 		log.F().Fatal(err.Error())

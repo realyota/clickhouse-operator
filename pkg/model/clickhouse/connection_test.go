@@ -23,9 +23,9 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
-	"strings"
 	"testing"
 	"time"
 
@@ -345,11 +345,15 @@ func TestTLSHandshake(t *testing.T) {
 	unrelatedPool := x509.NewCertPool()
 	unrelatedPool.AppendCertsFromPEM([]byte(generateSelfSignedPEM(t)))
 
+	// errCheck returns a non-empty failure message if err does not match the
+	// expected typed-error shape. Returning string-vs-bool lets each row name
+	// the expected x509 error type without coupling the assertion to Go's
+	// (release-to-release-mutable) error message wording.
 	cases := []struct {
-		name      string
-		cfg       *tls.Config
-		wantErr   bool
-		errSubstr string
+		name     string
+		cfg      *tls.Config
+		wantErr  bool
+		errCheck func(err error) string
 	}{
 		{
 			name: "valid CA + matching DNS SAN → handshake succeeds",
@@ -376,8 +380,14 @@ func TestTLSHandshake(t *testing.T) {
 				ServerName: "test-server.local",
 				MinVersion: tls.VersionTLS12,
 			},
-			wantErr:   true,
-			errSubstr: "unknown authority",
+			wantErr: true,
+			errCheck: func(err error) string {
+				var unkAuth x509.UnknownAuthorityError
+				if !errors.As(err, &unkAuth) {
+					return "expected x509.UnknownAuthorityError"
+				}
+				return ""
+			},
 		},
 		{
 			name: "hostname mismatch → handshake fails with name-not-valid error",
@@ -386,8 +396,14 @@ func TestTLSHandshake(t *testing.T) {
 				ServerName: "wrong.example.com",
 				MinVersion: tls.VersionTLS12,
 			},
-			wantErr:   true,
-			errSubstr: "valid for",
+			wantErr: true,
+			errCheck: func(err error) string {
+				var hostErr x509.HostnameError
+				if !errors.As(err, &hostErr) {
+					return "expected x509.HostnameError"
+				}
+				return ""
+			},
 		},
 		{
 			name: "explicit InsecureSkipVerify → handshake succeeds against unknown CA",
@@ -405,9 +421,10 @@ func TestTLSHandshake(t *testing.T) {
 			err := dialTLS(t, s.addr, c.cfg)
 			if c.wantErr {
 				require.Error(t, err, "expected handshake to fail")
-				if c.errSubstr != "" {
-					require.True(t, strings.Contains(err.Error(), c.errSubstr),
-						"expected error to contain %q; got: %v", c.errSubstr, err)
+				if c.errCheck != nil {
+					if msg := c.errCheck(err); msg != "" {
+						t.Fatalf("%s; got: %v", msg, err)
+					}
 				}
 			} else {
 				require.NoError(t, err)
@@ -444,8 +461,13 @@ func TestEnforceVerifiedLegacyTLS(t *testing.T) {
 		cfg := &tls.Config{InsecureSkipVerify: false}
 		err := dialTLS(t, s.addr, cfg)
 		require.Error(t, err, "verifying config must reject unknown CA")
-		require.True(t, strings.Contains(err.Error(), "unknown authority"),
-			"expected unknown-authority error; got: %v", err)
+		// Type-based assertion: Go's x509 error wording changes between
+		// releases (e.g. Go 1.26 reshaped the unknown-authority message),
+		// but the error TYPE is part of the stdlib API contract.
+		var unkAuth x509.UnknownAuthorityError
+		if !errors.As(err, &unkAuth) {
+			t.Fatalf("expected x509.UnknownAuthorityError, got: %v", err)
+		}
 	})
 
 	// Pin the explicit MinVersion floor per FIPS spec §2 L37 ("TLS minimum

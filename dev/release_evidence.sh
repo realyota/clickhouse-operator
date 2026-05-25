@@ -59,12 +59,17 @@ OUT_DIR="${2:-./release-evidence/}"
 # Path-safe filename: replace '/' and ':' with '__'.
 SAFE_TAG="${IMAGE_REF//\//__}"
 SAFE_TAG="${SAFE_TAG//:/__}"
+# Restrict to a known-safe charset; other specials (@, spaces, parens, *) -> '_'.
+SAFE_TAG="${SAFE_TAG//[^A-Za-z0-9._-]/_}"
 
 # --- Tool checks -------------------------------------------------------------
 
 require_tool docker
 require_tool syft
 require_tool jq
+# Used by the sha256sum-of-manifest fallback in step 2.
+require_tool sha256sum
+require_tool awk
 
 # `docker buildx` is a plugin; verify it's wired in.
 if ! docker buildx version >/dev/null 2>&1; then
@@ -103,18 +108,29 @@ fi
 
 log "step 2/3: capturing digest -> ${DIGEST_FILE}"
 DIGEST=""
-if DIGEST="$(docker buildx imagetools inspect "${IMAGE_REF}" --format '{{.Manifest.Digest}}' 2>/dev/null)" \
-        && [[ -n "${DIGEST}" ]] && [[ "${DIGEST}" == sha256:* ]]; then
+# Capture stderr so registry/auth/network failures surface in the fallback log
+# instead of being silently swallowed.
+inspect_err="$(mktemp)"
+if DIGEST="$(docker buildx imagetools inspect "${IMAGE_REF}" --format '{{.Manifest.Digest}}' 2>"${inspect_err}")" \
+        && [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
     log "digest via buildx --format: ${DIGEST}"
 else
     # Fallback: digest of a registry manifest is sha256 over its raw bytes.
-    log "buildx --format unavailable; falling back to sha256sum of manifest"
+    log "WARNING: --format digest capture failed; computing from manifest. Buildx stderr was:"
+    cat "${inspect_err}" >&2 || true
     if ! DIGEST="sha256:$(sha256sum < "${MANIFEST_FILE}" | awk '{print $1}')"; then
         log "failed to compute fallback digest"
+        rm -f "${inspect_err}"
+        exit 4
+    fi
+    if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        log "fallback digest is malformed: ${DIGEST}"
+        rm -f "${inspect_err}"
         exit 4
     fi
     log "digest via fallback: ${DIGEST}"
 fi
+rm -f "${inspect_err}"
 printf '%s\n' "${DIGEST}" > "${DIGEST_FILE}"
 
 # --- Step 3: generate SBOM via syft ------------------------------------------

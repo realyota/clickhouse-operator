@@ -200,8 +200,25 @@ if [[ "${EVIDENCE}" == "yes" ]]; then
         echo "WARNING: EVIDENCE=yes requires DOCKERHUB_PUBLISH=yes; evidence capture needs a registry-pushed image. Skipping." >&2
     else
         EVIDENCE_EFFECTIVE="yes"
-        DOCKER_CMD="${DOCKER_CMD} --sbom=true --provenance=mode=max --metadata-file ${BIN_NAME:-image}-build-metadata.json"
     fi
+fi
+
+# Pre-flight: fail fast if EVIDENCE=yes but the post-build tools used by release_evidence.sh are missing.
+# Without this, the developer spends 5-10 min on a multi-arch buildx push only to hit:
+#   release_evidence: missing required tool: syft
+# 'docker' is already guarded upstream; only 'syft' and 'jq' need checking here.
+if [[ "${EVIDENCE_EFFECTIVE}" == "yes" ]]; then
+    for tool in syft jq; do
+        if ! command -v "${tool}" >/dev/null 2>&1; then
+            echo "ERROR: EVIDENCE=yes requires '${tool}' on PATH but it is not installed." >&2
+            case "${tool}" in
+                syft) echo "Install: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin" >&2 ;;
+                jq)   echo "Install: apt-get install -y jq  (or brew install jq)" >&2 ;;
+            esac
+            exit 1
+        fi
+    done
+    DOCKER_CMD="${DOCKER_CMD} --sbom=true --provenance=mode=max --metadata-file ${BIN_NAME:-image}-build-metadata.json"
 fi
 
 # Append tag, dockerfile and SRC_ROOT

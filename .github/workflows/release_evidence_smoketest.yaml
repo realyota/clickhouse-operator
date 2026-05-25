@@ -46,7 +46,7 @@ jobs:
         run: |
           export GO_VERSION=$(grep '^go ' go.mod | awk '{print $2}')
           export GOFIPS140=v1.0.0
-          export SMOKETAG="smoketest-pr${PR_NUMBER:-manual}"
+          export SMOKETAG="smoketest-pr${PR_NUMBER:-manual}-${{ github.run_id }}"
 
           echo "Building operator image (smoketest, amd64, --load, SBOM + provenance + metadata)"
           docker buildx build --progress plain --platform=linux/amd64 -f dockerfile/operator/Dockerfile \
@@ -67,28 +67,37 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          export SMOKETAG="smoketest-pr${PR_NUMBER:-manual}"
+          export SMOKETAG="smoketest-pr${PR_NUMBER:-manual}-${{ github.run_id }}"
           mkdir -p release-evidence
-          cp operator-build-metadata.json metrics-exporter-build-metadata.json release-evidence/ || true
+          cp operator-build-metadata.json metrics-exporter-build-metadata.json release-evidence/
           ./dev/release_evidence.sh clickhouse-operator:${SMOKETAG} release-evidence/
           ./dev/release_evidence.sh metrics-exporter:${SMOKETAG}   release-evidence/
       - name: Assert expected evidence artifacts exist and are non-empty
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          export SMOKETAG="smoketest-pr${PR_NUMBER:-manual}"
+          export SMOKETAG="smoketest-pr${PR_NUMBER:-manual}-${{ github.run_id }}"
+          command -v jq >/dev/null 2>&1 || { echo "evidence-smoketest: jq missing, installing"; sudo apt-get update && sudo apt-get install -y jq; }
           for f in \
             "release-evidence/clickhouse-operator__${SMOKETAG}.digest.txt" \
             "release-evidence/clickhouse-operator__${SMOKETAG}.sbom.spdx.json" \
+            "release-evidence/clickhouse-operator__${SMOKETAG}.manifest.json" \
             "release-evidence/metrics-exporter__${SMOKETAG}.digest.txt" \
             "release-evidence/metrics-exporter__${SMOKETAG}.sbom.spdx.json" \
+            "release-evidence/metrics-exporter__${SMOKETAG}.manifest.json" \
           ; do
             test -s "$f" || { echo "evidence-smoketest: missing or empty $f"; exit 1; }
             echo "OK: $f ($(wc -c <"$f") bytes)"
           done
+          for f in release-evidence/*.sbom.spdx.json; do
+            test -s "$f" || { echo "missing SBOM: $f"; exit 1; }
+            jq -e '.spdxVersion and (.packages | length > 0)' "$f" >/dev/null || {
+              echo "SBOM malformed or empty: $f"; exit 1;
+            }
+          done
       - name: Upload smoketest evidence artifact
         uses: actions/upload-artifact@v4
         with:
-          name: evidence-smoketest-pr${{ github.event.pull_request.number }}
+          name: evidence-smoketest-pr${{ github.event.pull_request.number || 'manual' }}-${{ github.run_id }}
           path: release-evidence/
           retention-days: 7

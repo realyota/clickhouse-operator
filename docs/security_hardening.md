@@ -825,8 +825,6 @@ following sites are explicitly **outside the FIPS cryptographic boundary**:
 - `pkg/util/hash.go::HashIntoString` — SHA-1 of serialized object → deterministic
   identifier (`Fingerprint`, then K8s `clickhouse.altinity.com/object-version`
   label value). No integrity, no signing, no authentication use.
-- `pkg/util/string.go::CreateStringID` — SHA-1 of a string → deterministic ID
-  for sort-stable identifier purposes.
 - `pkg/util/shell.go::BuildShellEnvVarName` — MD5 suffix to disambiguate long
   shell env-var names. Truncation-disambiguation use only.
 

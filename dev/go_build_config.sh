@@ -16,13 +16,33 @@ PKG_ROOT="${SRC_ROOT}/pkg"
 REPO="github.com/altinity/clickhouse-operator"
 
 # 0.9.3
-VERSION=$(cd "${SRC_ROOT}"; cat release)
+VERSION=$(cd "${SRC_ROOT}" && cat release)
 # 885c3f7
-GIT_SHA=$(cd "${SRC_ROOT}"; git rev-parse --short HEAD)
+GIT_SHA=$(cd "${SRC_ROOT}" && git rev-parse --short HEAD)
 # 2020-03-07 14:54:56
 NOW=$(date "+%FT%T")
 # Which version of golang to use. Ex.: 1.23.0
-GO_VERSION=$(cd "${SRC_ROOT}"; grep '^go ' go.mod | awk '{print $2}')
+GO_VERSION=$(cd "${SRC_ROOT}" && grep '^go ' go.mod | awk '{print $2}')
+
+# NOTE: this file is SOURCED by ~20 callers. We deliberately do NOT enable
+# `set -euo pipefail` here because that would silently change the strictness
+# of every caller's shell, breaking scripts that reference legitimately-unset
+# env vars (e.g. ${VERBOSITY} in build_manifests.sh). Instead, fail-fast on
+# the specific HAZARD: empty VERSION / GIT_SHA / GO_VERSION getting baked
+# into binaries or manifests. These guards run in the caller's shell and
+# abort it via `exit 1` if a critical value is missing.
+if [[ -z "${VERSION}" ]]; then
+    echo "ERROR: go_build_config.sh: VERSION is empty (missing or unreadable ${SRC_ROOT}/release)" >&2
+    exit 1
+fi
+if [[ -z "${GIT_SHA}" ]]; then
+    echo "ERROR: go_build_config.sh: GIT_SHA is empty (not a git repo or git not on PATH at ${SRC_ROOT})" >&2
+    exit 1
+fi
+if [[ -z "${GO_VERSION}" ]]; then
+    echo "ERROR: go_build_config.sh: GO_VERSION is empty (missing 'go <ver>' line in ${SRC_ROOT}/go.mod)" >&2
+    exit 1
+fi
 
 # Go FIPS 140-3 module version. Setting GOFIPS140 at build time links the Go
 # FIPS 140-3 cryptographic module (`crypto/fips140` v1.0.0, currently in CMVP

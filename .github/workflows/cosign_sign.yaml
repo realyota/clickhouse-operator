@@ -24,6 +24,12 @@ jobs:
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
+        with:
+          # workflow_run defaults to the default branch, NOT the ref that built
+          # the images upstream, so `cat release` could read the wrong file.
+          # Pin to the head commit of the triggering run; fall back to
+          # github.sha for the workflow_dispatch path (no workflow_run context).
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
@@ -74,6 +80,18 @@ jobs:
           done
           echo "pinned=${refs# }" >> "$GITHUB_OUTPUT"
 
+      - name: Login to Docker Hub
+        # Keyless cosign still needs registry write access to push the signature
+        # OCI artifact alongside the image. Gated by the same images!='' check
+        # as the sign step so fork PRs (no DOCKER_* secrets) skip cleanly.
+        if: ${{ steps.refs.outputs.images != '' }}
+        env:
+          DOCKER_USER: ${{ secrets.DOCKER_USER }}
+          DOCKER_PASS: ${{ secrets.DOCKER_PASS }}
+        run: |
+          set -euo pipefail
+          echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin docker.io
+
       - name: Sign images (keyless via Sigstore)
         if: ${{ steps.refs.outputs.images != '' }}
         run: |
@@ -104,6 +122,10 @@ jobs:
             safe=$(echo "${img}" | tr '/:@' '___')
             echo "Capturing digest + signature payload for ${img}"
             cosign triangulate "${img}" > "cosign-evidence/${safe}.sig-ref.txt"
+            # The "Verify signatures" step above already fails the job hard if
+            # any signature is bad. This re-run only captures the verify output
+            # as an evidence artifact, so `|| true` preserves partial evidence
+            # without re-asserting on an already-checked verify result.
             cosign verify \
               --certificate-identity-regexp "https://github.com/Altinity/clickhouse-operator/.*" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \

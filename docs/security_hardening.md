@@ -756,19 +756,20 @@ glibc/OpenSSL dependency). Supported architectures: `linux/amd64`,
 
 The operator and metrics-exporter images ship with `GODEBUG=fips140=on` as the
 default. This mode filters TLS versions, cipher suites, signature algorithms,
-key exchanges, and certificate chains to FIPS-approved primitives, while
-permitting non-security uses of MD5/SHA-1 (see "Non-security hash exclusions"
-below).
+key exchanges, and certificate chains to FIPS-approved primitives. The
+operator's identifier-derivation code (object-version labels, env-var name
+disambiguation) uses inline pure-Go bitwise implementations that do not invoke
+`crypto/sha1` or `crypto/md5` — see "Non-security hash exclusions" below.
 
 | Mode | `GODEBUG` value | What it does | Image tag |
 |---|---|---|---|
 | Default | `fips140=on` | Filters TLS versions, cipher suites, signature algorithms, key exchanges, FIPS-compatible certificate chains | `altinity/clickhouse-operator:<version>` |
+| Strict (opt-in) | `fips140=only` | As above, plus panics on any `crypto/...` call that touches a non-approved primitive. Supported at container start via `-e GODEBUG=fips140=only` — the operator's identifier-derivation paths no longer trigger this panic. | (same image; runtime override) |
 
-To exercise the stricter `fips140=only` mode (which panics on any non-approved
-primitive, including the non-security MD5/SHA-1 sites listed below) at
-container-run time, override `-e GODEBUG=fips140=only`. The default image is
-the only published image — there is no separate `:<version>`-suffixed FIPS
-build.
+As a result, customers who want strict-FIPS defense-in-depth can set
+`-e GODEBUG=fips140=only` at container start and the operator continues to
+function. The shipped default remains `fips140=on`. The default image is the
+only published image — there is no separate `:<version>`-suffixed FIPS build.
 
 ### Knobs
 
@@ -820,19 +821,37 @@ reachable from `run_tests_*` and is excluded from CI.
 ### Non-security hash exclusions (scanner allow-list)
 
 Per the FIPS scope document (§3 "Security-Sensitive Crypto Only"), the
-following sites are explicitly **outside the FIPS cryptographic boundary**:
+following sites are explicitly **outside the FIPS cryptographic boundary**.
+Both compute deterministic identifiers for K8s label uniqueness and shell
+env-var name disambiguation; they are NOT signatures, NOT MACs, NOT key
+derivation, NOT integrity proofs — just deterministic byte-mixing whose only
+contract is collision rarity and stability across releases.
 
-- `pkg/util/hash.go::HashIntoString` — SHA-1 of serialized object → deterministic
-  identifier (`Fingerprint`, then K8s `clickhouse.altinity.com/object-version`
-  label value). No integrity, no signing, no authentication use.
-- `pkg/util/shell.go::BuildShellEnvVarName` — MD5 suffix to disambiguate long
-  shell env-var names. Truncation-disambiguation use only.
+- `pkg/util/hash.go::HashIntoString` — produces the 40-char hex fingerprint
+  used by `Fingerprint()` and the K8s
+  `clickhouse.altinity.com/object-version` label value. The digest is
+  computed by an **inline pure-Go bitwise implementation** of the algorithm
+  specified by FIPS PUB 180-4 §6.1.2 / RFC 3174 — `crypto/sha1` is not
+  imported. The standard is cited only as a reference for byte-output
+  compatibility (existing labels stay byte-identical across the upgrade, no
+  StatefulSet rollout), not as a claim of cryptographic protection.
+- `pkg/util/shell.go::BuildShellEnvVarName` — appends a 32-char hex
+  uniqueness suffix when a generated env-var name exceeds the base length
+  budget. The suffix is computed by an **inline pure-Go bitwise
+  implementation** of the algorithm specified by RFC 1321 — `crypto/md5` is
+  not imported. As above, the RFC is cited only as a reference for
+  byte-output compatibility (existing env-var names stay byte-identical), not
+  as a claim of cryptographic protection.
 
-These are deterministic-ID helpers retained for back-compat (changing them
-re-hashes every K8s object's label on upgrade). Scanner reports against these
-files are out of scope. The shipped runtime (`fips140=on`) permits them;
-overriding the container to `GODEBUG=fips140=only` would panic on these
-sites, which is why the shipped default is `fips140=on`.
+Because neither call site references `crypto/sha1` or `crypto/md5`, the
+operator binary no longer panics under the stricter `GODEBUG=fips140=only`
+runtime override — that mode is now a supported opt-in for customers wanting
+strict-FIPS defense-in-depth, set at container start with
+`-e GODEBUG=fips140=only`. The shipped default remains `fips140=on`. The
+byte-identical output guarantee means changing the runtime mode never
+re-hashes a K8s object's label or env-var name on upgrade. Scanner reports
+against these two files are out of scope per FIPS scope spec §3
+(`~/Downloads/fips.md` §3 "Security-Sensitive Crypto Only").
 
 In addition, the following vendored telemetry libraries contain internal
 non-security hashing / sampling that is **outside the FIPS cryptographic
@@ -861,13 +880,16 @@ so a non-FIPS chain may sit dormant until the first dial.
 - **The operator itself never generates or accepts SHA-1 in TLS**; the
   prerequisite is about the certificates you point it at.
 
-- Code-side audit: `pkg/util/shell.go` uses MD5 for non-cryptographic
-  env-var-name uniqueness. Documented as outside the FIPS cryptographic
-  boundary per the FIPS scope specification (§3, see this document for the
-  operator-side boundary and [Go FIPS 140-3 mode](https://go.dev/doc/security/fips140)
-  for the Go-side runtime semantics); the shipped `fips140=on` runtime
-  permits it, while a container-level override to `fips140=only` would panic
-  on it.
+- Code-side audit: `pkg/util/shell.go::BuildShellEnvVarName` and
+  `pkg/util/hash.go::HashIntoString` derive deterministic identifiers using
+  inline pure-Go bitwise implementations of the algorithms specified by
+  RFC 1321 and FIPS PUB 180-4 §6.1.2 / RFC 3174 respectively. Neither
+  imports `crypto/md5` or `crypto/sha1`. Documented as outside the FIPS
+  cryptographic boundary per the FIPS scope specification (§3 of
+  `~/Downloads/fips.md`); both the shipped `fips140=on` runtime and the
+  strict opt-in `fips140=only` override permit these paths (see
+  [Go FIPS 140-3 mode](https://go.dev/doc/security/fips140) for Go-side
+  runtime semantics).
 
 ### ZooKeeper digest-auth policy
 

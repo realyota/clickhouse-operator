@@ -51,8 +51,8 @@ func fipsGate() {
 		// (from connection.init() / setupTLSBasic) with a verifying config.
 		// DSNs that didn't go through setupTLSAdvanced (no explicit security
 		// knobs) thus get verified TLS instead of the default-insecure
-		// pre-0.27.1 fallback. Spec fips.md §2: InsecureSkipVerify is rejected
-		// under security.fips.enforced=true.
+		// pre-0.27.1 fallback. Under security.fips.enforced=true,
+		// InsecureSkipVerify is rejected (verified TLS required).
 		chclient.EnforceVerifiedLegacyTLS()
 	}
 }

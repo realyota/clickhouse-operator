@@ -526,10 +526,11 @@ Setting `security.policy: Enforced` and `security.fips.enforced: true`
 together is supported and idempotent: the TLS coercions fire once, the
 FIPS-binary assertion fires once, and the operator logs both decisions.
 
-**Spec-deviation note**: the FIPS scope specification (`fips.md` §6 step 2)
-names this knob `operator.security.fips.enabled`. The operator ships it as
-`security.fips.enforced` because the gate Fatals at startup on mismatch —
-`enforced` more accurately describes the strict-failure semantics than
+**Spec-deviation note**: the internal Altinity FIPS scope specification
+(§6 step 2) names this knob `operator.security.fips.enabled`. The operator
+ships it as `security.fips.enforced` because the gate Fatals at startup on
+mismatch — `enforced` more accurately describes the strict-failure semantics
+than
 `enabled` (which would suggest a soft toggle). The two names refer to the
 same control surface; this rename is a wording deviation only, not a
 behavioral one. Either-switch fan-out (TLS coercions firing when EITHER
@@ -850,8 +851,8 @@ strict-FIPS defense-in-depth, set at container start with
 `-e GODEBUG=fips140=only`. The shipped default remains `fips140=on`. The
 byte-identical output guarantee means changing the runtime mode never
 re-hashes a K8s object's label or env-var name on upgrade. Scanner reports
-against these two files are out of scope per FIPS scope spec §3
-(`~/Downloads/fips.md` §3 "Security-Sensitive Crypto Only").
+against these two files are out of scope per the internal Altinity FIPS
+scope specification §3 "Security-Sensitive Crypto Only".
 
 In addition, the following vendored telemetry libraries contain internal
 non-security hashing / sampling that is **outside the FIPS cryptographic
@@ -885,9 +886,9 @@ so a non-FIPS chain may sit dormant until the first dial.
   inline pure-Go bitwise implementations of the algorithms specified by
   RFC 1321 and FIPS PUB 180-4 §6.1.2 / RFC 3174 respectively. Neither
   imports `crypto/md5` or `crypto/sha1`. Documented as outside the FIPS
-  cryptographic boundary per the FIPS scope specification (§3 of
-  `~/Downloads/fips.md`); both the shipped `fips140=on` runtime and the
-  strict opt-in `fips140=only` override permit these paths (see
+  cryptographic boundary per the internal Altinity FIPS scope specification
+  §3; both the shipped `fips140=on` runtime and the strict opt-in
+  `fips140=only` override permit these paths (see
   [Go FIPS 140-3 mode](https://go.dev/doc/security/fips140) for Go-side
   runtime semantics).
 

@@ -178,6 +178,10 @@ DOCKER_CMD="${DOCKER_CMD} --build-arg VERSION=${VERSION:-dev} --build-arg GO_VER
 # Pass empty string explicitly to disable FIPS for non-FIPS-target images.
 DOCKER_CMD="${DOCKER_CMD} --build-arg GOFIPS140=${GOFIPS140}"
 
+# Append GODEBUG_FIPS140 build arg (sourced from go_build_config.sh, default: only).
+# Selects runtime FIPS enforcement level baked into the image's ENV GODEBUG.
+DOCKER_CMD="${DOCKER_CMD} --build-arg GODEBUG_FIPS140=${GODEBUG_FIPS140}"
+
 # Append GC flags if present (default empty for set -u compat — GCFLAGS is
 # only set by callers building with debug/race instrumentation).
 if [[ -n "${GCFLAGS:-}" ]]; then

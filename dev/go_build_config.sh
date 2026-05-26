@@ -58,6 +58,15 @@ fi
 # to the explicit version (e.g. v1.0.0).
 GOFIPS140="${GOFIPS140-v1.0.0}"
 
+# Runtime FIPS enforcement mode baked into the published image via Dockerfile
+# `ENV GODEBUG=fips140=${GODEBUG_FIPS140}`. Accepted values: only|on|off.
+#   only — strict: non-FIPS primitives panic at call time (shipped default).
+#   on   — permissive: TLS/cipher/sig filtering, non-FIPS calls allowed.
+#   off  — Go runtime default (no FIPS gating).
+# Customer runtime overrides via Pod env / Helm `operator.env` / kubectl set env
+# still win over the image-baked default.
+GODEBUG_FIPS140="${GODEBUG_FIPS140-only}"
+
 # Release evidence capture. Default off; CI workflows set EVIDENCE=yes
 # explicitly. Local devs can opt in with `EVIDENCE=yes ./dev/image_build_all.sh ...`
 # to also produce SBOM / digest / manifest artifacts under EVIDENCE_DIR.

@@ -37,7 +37,7 @@ func fipsGate() {
 		fips.GODEBUGRaw(),
 		fips.BuildSetting("DefaultGODEBUG"),
 		fips.BuildSetting("GOFIPS140"))
-	err, warn := fips.EvaluateGate("metrics-exporter", fipsEnforced, build, runtime)
+	err, warn := fips.EvaluateGate("metrics-exporter", fipsEnforced, build, runtime, fips.BuildSetting("DefaultGODEBUG"))
 	if err != nil {
 		log.F().Fatal(err.Error())
 	}

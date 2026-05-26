@@ -7181,12 +7181,16 @@ def test_010076(self):
     that drops GOFIPS140 silently downgrades FIPS strength across the whole
     fleet, so we fail the e2e run rather than let it slip through.
 
-    Runtime mode is `GODEBUG=fips140=on` in the default image (filters TLS,
-    cipher suites, sig algs, key exchanges) — `runtime.enforced=false` is the
-    expected value here because `Enforced()` only reports `true` under the
-    stricter `fips140=only`, which is not the shipped default. Non-security
-    SHA-1/MD5 hashing in `pkg/util/{hash,string,shell}.go` is intentional and
-    outside the FIPS cryptographic boundary per `docs/security_hardening.md` §3.
+    Runtime mode is `GODEBUG=fips140=only` in the default image (strict: any
+    invocation of a non-FIPS primitive panics at call time). `runtime.enforced`
+    therefore reads `true` for the shipped default — the test asserts that
+    explicitly. The `pkg/util/{hash,string,shell}.go` deterministic-identifier
+    hashing uses inline pure-Go SHA-1/MD5 implementations that do NOT invoke
+    `crypto/sha1`/`crypto/md5`, so they remain safe under `fips140=only`. See
+    `docs/security_hardening.md` §3 for the FIPS-boundary rationale. The
+    `GODEBUG_FIPS140` Docker build-arg parameterizes the baked default
+    (`only`|`on`|`off`); customers can override at runtime via Pod env,
+    Helm `operator.env`, or `kubectl set env`.
 
     Build linkage is driven by `dev/go_build_config.sh` defaulting GOFIPS140
     to v1.0.0 and propagated by every image-build entrypoint (CI, dev-image,
@@ -7241,6 +7245,17 @@ def test_010076(self):
             f"(expected true — GOFIPS140 build tag missing)"
         )
 
+    with And("Banner reports strict runtime (runtime.enforced=true) for shipped default"):
+        # Shipped default since 0.27.1: Dockerfile bakes GODEBUG=fips140=only
+        # via ARG GODEBUG_FIPS140=only. Enforced() reads true. A regression
+        # that drops the build-arg or flips it back to `on` slips strict-mode
+        # silently — fail the gate so the drop is visible.
+        runtime_enforced = m.group(3)
+        assert runtime_enforced == "true", error(
+            f"operator runtime.enforced={runtime_enforced} (expected true — "
+            f"GODEBUG_FIPS140 build-arg may have flipped from only to on)"
+        )
+
     with And("FIPS env line is present (soft-fail: forward-compatible)"):
         # Soft-fail with a warning rather than assert: A2's banner enhancement
         # adds a second `FIPS env: GODEBUG=... DefaultGODEBUG=... GOFIPS140=...`
@@ -7269,6 +7284,13 @@ def test_010076(self):
         assert build_enabled == "true", error(
             f"metrics-exporter image is NOT FIPS-built: build.enabled={build_enabled} "
             f"(expected true — GOFIPS140 build tag missing from exporter image)"
+        )
+
+    with And("Banner reports strict runtime (runtime.enforced=true) for metrics-exporter"):
+        runtime_enforced = m.group(3)
+        assert runtime_enforced == "true", error(
+            f"metrics-exporter runtime.enforced={runtime_enforced} (expected "
+            f"true — GODEBUG_FIPS140 build-arg may have flipped from only to on)"
         )
 
     with And("FIPS env line is present in metrics-exporter logs (soft-fail)"):

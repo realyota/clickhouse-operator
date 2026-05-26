@@ -111,7 +111,7 @@ def _build_acvp_binary(cmd_path, binary_name):
     # crypto/fips140.Enabled() reports false. v1.0.0 matches the build pinned
     # in dev/go_build_config.sh.
     env.setdefault("GOFIPS140", "v1.0.0")
-    env.setdefault("GODEBUG", "fips140=on")
+    env.setdefault("GODEBUG", "fips140=only")
     env.setdefault("CGO_ENABLED", "0")
 
     result = subprocess.run(
@@ -147,7 +147,7 @@ def _build_acvp_binary(cmd_path, binary_name):
 def _invoke_responder(binary_path, request_blob, timeout=15):
     """Run the responder once, sending request_blob on stdin and returning stdout."""
     env = os.environ.copy()
-    env["GODEBUG"] = "fips140=on"
+    env["GODEBUG"] = "fips140=only"
     proc = subprocess.run(
         [binary_path],
         input=request_blob,

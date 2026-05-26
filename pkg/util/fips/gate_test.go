@@ -27,32 +27,39 @@ import (
 func TestEvaluateGate(t *testing.T) {
 	const bin = "clickhouse-operator"
 	cases := []struct {
-		name     string
-		enabled  bool
-		build    bool
-		runtime  bool
-		wantErr  string
-		wantWarn string
+		name           string
+		enabled        bool
+		build          bool
+		runtime        bool
+		defaultGODEBUG string
+		wantErr        string
+		wantWarn       string
 	}{
 		// Off — chopconf does not require FIPS; any binary/runtime is fine.
-		{"off / unconfigured runtime", false, false, false, "", ""},
-		{"off / FIPS-built only", false, true, false, "", ""},
-		// Strict-runtime without chopconf agreement is a WARN, not an error.
-		{"off / GODEBUG=only without build", false, false, true, "", "GODEBUG=fips140=only is set at runtime but security.fips.enforced is not set"},
-		{"off / GODEBUG=only with build", false, true, true, "", "GODEBUG=fips140=only is set at runtime but security.fips.enforced is not set"},
+		{"off / unconfigured runtime", false, false, false, "", "", ""},
+		{"off / FIPS-built only", false, true, false, "", "", ""},
+		// Strict-runtime without chopconf agreement is a WARN — when the
+		// runtime strictness comes from a user override (DefaultGODEBUG does
+		// NOT contain fips140=only), the chopconf disagreement is real.
+		{"off / GODEBUG=only without build, no baked default", false, false, true, "", "", "GODEBUG=fips140=only is set at runtime but security.fips.enforced is not set"},
+		{"off / GODEBUG=only with build, no baked default", false, true, true, "", "", "GODEBUG=fips140=only is set at runtime but security.fips.enforced is not set"},
+		// Strict-runtime that matches the binary-baked DefaultGODEBUG is the
+		// documented shipped posture — suppress the warning.
+		{"off / GODEBUG=only with build, baked default matches", false, true, true, "fips140=only", "", ""},
+		{"off / GODEBUG=only with build, baked default (with siblings)", false, true, true, "asyncpreemptoff=1,fips140=only", "", ""},
 
 		// Enabled — only the no-build cell errors.
-		{"enabled / no build", true, false, false, "not built with GOFIPS140", ""},
-		{"enabled / build, lenient runtime (default)", true, true, false, "", ""},
-		{"enabled / build, strict runtime", true, true, true, "", ""},
+		{"enabled / no build", true, false, false, "", "not built with GOFIPS140", ""},
+		{"enabled / build, lenient runtime (default)", true, true, false, "", "", ""},
+		{"enabled / build, strict runtime", true, true, true, "", "", ""},
 		// Unreachable in production (Enforced requires Enabled) but pure-fn test
 		// keeps the cell honest against future refactors.
-		{"enabled / no build, strict runtime", true, false, true, "not built with GOFIPS140", ""},
+		{"enabled / no build, strict runtime", true, false, true, "", "not built with GOFIPS140", ""},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err, warn := EvaluateGate(bin, c.enabled, c.build, c.runtime)
+			err, warn := EvaluateGate(bin, c.enabled, c.build, c.runtime, c.defaultGODEBUG)
 			if c.wantErr != "" {
 				require.Error(t, err, "expected gate to reject this matrix cell")
 				require.Contains(t, err.Error(), c.wantErr)

@@ -292,41 +292,47 @@ glibc/OpenSSL dependency). Supported architectures: `linux/amd64`,
 
 ### Runtime mode
 
-The operator and metrics-exporter images ship with `GODEBUG=fips140=only` as the
-default since 0.27.1. This is the strictest mode: any invocation of a non-FIPS
-primitive panics at call time. TLS versions, cipher suites, signature
-algorithms, key exchanges, and certificate chains are filtered to FIPS-approved
-primitives. The operator's identifier-derivation code (object-version labels,
-env-var name disambiguation) uses inline pure-Go bitwise implementations that do
-not invoke `crypto/sha1` or `crypto/md5` and remain compatible — see
+The operator and metrics-exporter images ship with `GODEBUG=fips140=off` as the
+shipped default. The Go FIPS 140-3 module is **linked** into the binary
+(`GOFIPS140=v1.0.0` at build time) but **dormant** at runtime — standard stdlib
+crypto is the active provider. This preserves pre-0.27.1 runtime behavior on
+upgrade. Customers opt the module into active mode at runtime via Pod env
+without needing to rebuild the image. The operator's identifier-derivation code
+(object-version labels, env-var name disambiguation) uses inline pure-Go bitwise
+implementations that do not invoke `crypto/sha1` or `crypto/md5`, so it runs
+cleanly under any of the four modes including the strictest `only` — see
 "Non-security hash exclusions" below.
+
+The Go runtime parses the `fips140` key of `GODEBUG` to one of **four** values:
 
 | Mode | `GODEBUG` value | What it does | How to select |
 |---|---|---|---|
-| Strict (default) | `fips140=only` | Filters TLS as in `on` AND panics on any `crypto/...` call that touches a non-approved primitive | Shipped default in `altinity/clickhouse-operator:<version>` |
-| Permissive (escape hatch) | `fips140=on` | Filters TLS versions, cipher suites, signature algorithms, key exchanges, FIPS-compatible certificate chains; allows non-FIPS calls outside the TLS layer | `-e GODEBUG=fips140=on` at container start, OR Pod `env:`, OR rebuild with `--build-arg GODEBUG_FIPS140=on` |
-| Off (debug) | (unset / `fips140=off`) | Go runtime default; no FIPS gating | `-e GODEBUG=` |
+| **Off (default)** | `fips140=off` | FIPS module not active. Standard stdlib crypto, no filtering, no panics. | Shipped default — baked via `ARG GODEBUG_FIPS140=off` |
+| **On** | `fips140=on` | Module active. TLS / cipher / signature / cert-chain selection filtered to FIPS-approved primitives. Non-approved direct calls outside TLS still callable. | `-e GODEBUG=fips140=on` at container start, OR Pod `env:`, OR `kubectl set env`, OR rebuild with `--build-arg GODEBUG_FIPS140=on` |
+| **Only (strict)** | `fips140=only` | Same as `on` plus any direct invocation of a non-FIPS-approved primitive panics at call time. Per Go upstream: best-effort, "not intended for production." Useful for CI gating. | `-e GODEBUG=fips140=only` runtime override or build-arg override |
+| **Debug** | `fips140=debug` | Same as `on` plus every call into the FIPS module is logged to stderr. Verbose; diagnostic only. | `-e GODEBUG=fips140=debug` runtime override |
 
-If the shipped strict default surfaces a regression in a customer's
-environment, the recommended escape hatch is `kubectl set env
-deploy/clickhouse-operator -n <ns> GODEBUG=fips140=on --containers='*'` — the
-operator pod rolls in ~30s and reconciliation resumes. Mirror the command for
-the metrics-exporter deployment when applicable. The default image is the
-only published image — there is no separate `:<version>`-suffixed FIPS build.
+If a customer needs strict-FIPS posture for an audit, the recommended path is
+`kubectl set env deploy/clickhouse-operator -n <ns> GODEBUG=fips140=on
+--containers='*'` (or `=only` for strict). The operator pod rolls in ~30s and
+reconciliation resumes. Mirror the command for the metrics-exporter deployment
+when applicable. The default image is the only published image — there is no
+separate `:<version>`-suffixed FIPS build.
 
 ### Knobs
 
 - Build-time: `GOFIPS140` in `dev/go_build_config.sh` (default `v1.0.0`).
-  Pass `GOFIPS140=` (empty) to opt out for local non-FIPS builds.
-- Build-time: `GODEBUG_FIPS140` in `dev/go_build_config.sh` (default `only`).
+  Pass `GOFIPS140=` (empty) to opt out for local non-FIPS builds. The shipped
+  image is always GOFIPS140-linked; this knob is for dev convenience only.
+- Build-time: `GODEBUG_FIPS140` in `dev/go_build_config.sh` (default `off`).
   Sets the runtime mode baked into the image via the Dockerfile `ARG`
-  (`GODEBUG_FIPS140`). Override at build with `GODEBUG_FIPS140=on
-  ./dev/image_build_all.sh` or `docker buildx build --build-arg
-  GODEBUG_FIPS140=on …`.
+  (`GODEBUG_FIPS140`). Accepted values: `off` (default), `on`, `only`, `debug`.
+  Override at build with `GODEBUG_FIPS140=on ./dev/image_build_all.sh` or
+  `docker buildx build --build-arg GODEBUG_FIPS140=on …`.
 - Runtime: `ENV GODEBUG=fips140=${GODEBUG_FIPS140}` in each Dockerfile's
-  `image-prod` stage (resolves to `fips140=only` by default). Override at
-  container-run time with `-e GODEBUG=fips140=on` for the permissive mode
-  without rebuilding, or `-e GODEBUG=` to disable.
+  `image-prod` stage (resolves to `fips140=off` by default). Override at
+  container-run time with `-e GODEBUG=fips140=on` (permissive), `=only`
+  (strict), `=debug` (logging), or `-e GODEBUG=` (disable entirely).
 - `security.policy` chopconf knob: when `Enforced`, the operator coerces
   every per-component TLS toggle to Strict positions, rejects CHIs that
   cannot be served in a FIPS-compatible posture, and re-registers the
@@ -335,15 +341,17 @@ only published image — there is no separate `:<version>`-suffixed FIPS build.
   `GOFIPS140`. For that, set the orthogonal `security.fips.enforced: true`.
 - `security.fips.enforced` chopconf knob: when `true`, the operator Fatals at
   startup if the binary was not built with `GOFIPS140` and the runtime does
-  not report `crypto/fips140` Enabled. Also triggers the same TLS coercions
-  as `security.policy: Enforced` (a FIPS-asserted operator necessarily wants
-  verified TLS). Independent of `security.policy`.
+  not report `crypto/fips140` Enabled. With the shipped default
+  `GODEBUG=fips140=off`, setting `security.fips.enforced: true` will Fatal
+  the operator unless the customer also overrides `GODEBUG` to `on` or
+  `only` at the container level. Also triggers the same TLS coercions as
+  `security.policy: Enforced`. Independent of `security.policy`.
 
 ### Verify a built image
 
 ```bash
 docker run --rm --entrypoint=/bin/sh altinity/clickhouse-operator:<tag> \
-    -c 'echo $GODEBUG'   # expect: fips140=only
+    -c 'echo $GODEBUG'   # expect: fips140=off  (shipped default)
 go version -m dev/bin/clickhouse-operator | grep GOFIPS140
 ```
 
@@ -356,22 +364,26 @@ docker run --rm altinity/clickhouse-operator:<tag> -fips-info
 The operator banner at startup also reports the module version:
 
 ```
-FIPS: chopconf.policy=… build.enabled=… runtime.enforced=true module=v1.0.0
-FIPS env: GODEBUG=fips140=only DefaultGODEBUG=fips140=only GOFIPS140=v1.0.0
+FIPS: chopconf.policy=… build.enabled=true runtime.enforced=false module=v1.0.0
+FIPS env: GODEBUG=fips140=off DefaultGODEBUG=fips140=off GOFIPS140=v1.0.0
 ```
+
+Note that `build.enabled=true` (GOFIPS140 was linked at build time) but
+`runtime.enforced=false` (the module is dormant because GODEBUG=fips140=off).
+This is the shipped default. Customer overrides flip `runtime.enforced` to
+`true` when GODEBUG is set to `on` or `only`.
 
 The second `FIPS env:` line is new in 0.27.1 and is emitted by both the operator
 and the metrics-exporter. It echoes the **raw** `GODEBUG` environment variable
 as the process sees it, alongside the `DefaultGODEBUG` and `GOFIPS140` build
-settings read from `runtime/debug.ReadBuildInfo`. This disambiguates two
-postures that otherwise produce identical `crypto/fips140.Enabled=true` and
-`runtime.enforced=false` interpretations in the first banner line:
+settings read from `runtime/debug.ReadBuildInfo`. This disambiguates the
+shipped-default posture from customer overrides:
 
-- **Case 1** — binary built with `GOFIPS140=v1.0.0`, container started with
-  `GODEBUG` unset → `FIPS env: GODEBUG= DefaultGODEBUG=fips140=only GOFIPS140=v1.0.0`.
-  The runtime is in strict `only` mode courtesy of the baked-in `DefaultGODEBUG`.
-- **Case 2** — binary built with `GOFIPS140=v1.0.0`, container started with
-  `-e GODEBUG=fips140=on` → `FIPS env: GODEBUG=fips140=on DefaultGODEBUG=fips140=only GOFIPS140=v1.0.0`.
+- **Case 1 (shipped default)** — binary built with `GOFIPS140=v1.0.0`,
+  container started without env override → `FIPS env: GODEBUG= DefaultGODEBUG=fips140=off GOFIPS140=v1.0.0`.
+  Module is linked but dormant.
+- **Case 2 (customer opt-in to permissive)** — same binary, container started with
+  `-e GODEBUG=fips140=on` → `FIPS env: GODEBUG=fips140=on DefaultGODEBUG=fips140=off GOFIPS140=v1.0.0`.
   The env override wins — the pod runs in permissive `on` mode.
 
 Reading the raw `GODEBUG` value is the recommended first step when triaging
@@ -429,16 +441,15 @@ contract is collision rarity and stability across releases.
   as a claim of cryptographic protection.
 
 Because neither call site references `crypto/sha1` or `crypto/md5`, the
-operator binary runs cleanly under the strict `GODEBUG=fips140=only` runtime
-mode — which is the shipped default since 0.27.1. Customers who need to
-relax to the permissive `fips140=on` mode (e.g. for a downstream vendored
-dependency that touches a non-FIPS primitive in a code path not yet inlined)
-can set `-e GODEBUG=fips140=on` at container start or `kubectl set env
-deploy/clickhouse-operator GODEBUG=fips140=on`. The byte-identical output
-guarantee means changing the runtime mode never re-hashes a K8s object's
-label or env-var name on upgrade. Scanner reports against these two files
-are out of scope per the internal Altinity FIPS scope specification §3
-"Security-Sensitive Crypto Only".
+operator binary runs cleanly under any of the four `GODEBUG=fips140` modes,
+including the strictest `=only`. The shipped default is `=off` (FIPS module
+dormant); customers opt the module into active mode at runtime via Pod env
+(`=on` for permissive, `=only` for strict-panic, `=debug` for verbose
+diagnostics) without rebuilding. The byte-identical output guarantee means
+changing the runtime mode never re-hashes a K8s object's label or env-var name
+on upgrade. Scanner reports against these two files are out of scope per the
+internal Altinity FIPS scope specification §3 "Security-Sensitive Crypto
+Only".
 
 In addition, the following vendored telemetry libraries contain internal
 non-security hashing / sampling that is **outside the FIPS cryptographic
@@ -453,10 +464,12 @@ Scanner reports against these vendor paths are out of scope.
 
 ### Prerequisites for the deployment
 
-Under both `fips140=only` (default) and `fips140=on` (escape-hatch) modes, the
-runtime filters TLS chains for FIPS-approved primitives. The handshake fails
-at use time, not at load time, so a non-FIPS chain may sit dormant until the
-first dial.
+When the FIPS module is **active** (`GODEBUG=fips140=on` or `=only` — opt-in;
+not the shipped default), the runtime filters TLS chains for FIPS-approved
+primitives. The handshake fails at use time, not at load time, so a non-FIPS
+chain may sit dormant until the first dial. The prerequisites below only apply
+to deployments that opt the module into active mode; the shipped default
+(`fips140=off`) uses standard stdlib crypto and has no SHA-1-cert restriction.
 
 - **Kubeconfig CA**: must be signed with SHA-256 or later. SHA-1- or
   MD5-signed CAs cause a TLS handshake failure the first time the operator
@@ -474,8 +487,8 @@ first dial.
   RFC 1321 and FIPS PUB 180-4 §6.1.2 / RFC 3174 respectively. Neither
   imports `crypto/md5` or `crypto/sha1`. Documented as outside the FIPS
   cryptographic boundary per the internal Altinity FIPS scope specification
-  §3; both the shipped `fips140=only` runtime and the permissive
-  `fips140=on` override permit these paths (see
+  §3; all four `GODEBUG=fips140` modes (`off`, `on`, `only`, `debug`)
+  permit these paths (see
   [Go FIPS 140-3 mode](https://go.dev/doc/security/fips140) for Go-side
   runtime semantics).
 

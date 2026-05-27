@@ -7181,16 +7181,20 @@ def test_010076(self):
     that drops GOFIPS140 silently downgrades FIPS strength across the whole
     fleet, so we fail the e2e run rather than let it slip through.
 
-    Runtime mode is `GODEBUG=fips140=only` in the default image (strict: any
-    invocation of a non-FIPS primitive panics at call time). `runtime.enforced`
-    therefore reads `true` for the shipped default — the test asserts that
-    explicitly. The `pkg/util/{hash,string,shell}.go` deterministic-identifier
+    Runtime mode is `GODEBUG=fips140=off` in the default image (FIPS module
+    linked into the binary but not active at runtime). `runtime.enforced`
+    therefore reads `false` for the shipped default — the test asserts that
+    explicitly. Customers opt the module into active mode via Pod env
+    (`GODEBUG=fips140=on` for permissive, `=only` for strict-panic) without
+    needing to rebuild. The `pkg/util/{hash,shell}.go` deterministic-identifier
     hashing uses inline pure-Go SHA-1/MD5 implementations that do NOT invoke
-    `crypto/sha1`/`crypto/md5`, so they remain safe under `fips140=only`. See
-    `docs/security_hardening_fips.md` § "Non-security hash exclusions" for the FIPS-boundary rationale. The
-    `GODEBUG_FIPS140` Docker build-arg parameterizes the baked default
-    (`only`|`on`|`off`); customers can override at runtime via Pod env,
-    Helm `operator.env`, or `kubectl set env`.
+    `crypto/sha1`/`crypto/md5`, so they remain safe even under the strictest
+    `fips140=only` override. See
+    `docs/security_hardening_fips.md` § "Non-security hash exclusions" for the
+    FIPS-boundary rationale. The `GODEBUG_FIPS140` Docker build-arg
+    parameterizes the baked default (accepted: `off`|`on`|`only`|`debug`);
+    customers can override at runtime via Pod env, Helm `operator.env`, or
+    `kubectl set env`.
 
     Build linkage is driven by `dev/go_build_config.sh` defaulting GOFIPS140
     to v1.0.0 and propagated by every image-build entrypoint (CI, dev-image,
@@ -7245,15 +7249,16 @@ def test_010076(self):
             f"(expected true — GOFIPS140 build tag missing)"
         )
 
-    with And("Banner reports strict runtime (runtime.enforced=true) for shipped default"):
-        # Shipped default since 0.27.1: Dockerfile bakes GODEBUG=fips140=only
-        # via ARG GODEBUG_FIPS140=only. Enforced() reads true. A regression
-        # that drops the build-arg or flips it back to `on` slips strict-mode
-        # silently — fail the gate so the drop is visible.
+    with And("Banner reports inactive runtime (runtime.enforced=false) for shipped default"):
+        # Shipped default: Dockerfile bakes GODEBUG=fips140=off via ARG
+        # GODEBUG_FIPS140=off. The FIPS module is linked (build.enabled=true)
+        # but dormant — runtime.enforced reads false. A regression that flips
+        # the build-arg to `only` would silently enable strict mode for every
+        # customer on upgrade; fail the gate so that flip is visible at e2e.
         runtime_enforced = m.group(3)
-        assert runtime_enforced == "true", error(
-            f"operator runtime.enforced={runtime_enforced} (expected true — "
-            f"GODEBUG_FIPS140 build-arg may have flipped from only to on)"
+        assert runtime_enforced == "false", error(
+            f"operator runtime.enforced={runtime_enforced} (expected false — "
+            f"GODEBUG_FIPS140 build-arg may have flipped from off to on/only)"
         )
 
     with And("FIPS env line is present (soft-fail: forward-compatible)"):
@@ -7286,11 +7291,11 @@ def test_010076(self):
             f"(expected true — GOFIPS140 build tag missing from exporter image)"
         )
 
-    with And("Banner reports strict runtime (runtime.enforced=true) for metrics-exporter"):
+    with And("Banner reports inactive runtime (runtime.enforced=false) for metrics-exporter"):
         runtime_enforced = m.group(3)
-        assert runtime_enforced == "true", error(
+        assert runtime_enforced == "false", error(
             f"metrics-exporter runtime.enforced={runtime_enforced} (expected "
-            f"true — GODEBUG_FIPS140 build-arg may have flipped from only to on)"
+            f"false — GODEBUG_FIPS140 build-arg may have flipped from off to on/only)"
         )
 
     with And("FIPS env line is present in metrics-exporter logs (soft-fail)"):

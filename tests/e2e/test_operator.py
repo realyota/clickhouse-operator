@@ -7811,7 +7811,7 @@ def test_020005(self):
 
 
 @TestScenario
-@Name("test_020006. Test https://github.com/Altinity/clickhouse-operator/issues/1863")
+@Name("test_020006. Test 3-pod CHK installation with Prometheus metrics")
 def test_020006(self):
     create_shell_namespace_clickhouse_template()
 

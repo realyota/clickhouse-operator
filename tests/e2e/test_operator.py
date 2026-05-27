@@ -7187,7 +7187,7 @@ def test_010076(self):
     explicitly. The `pkg/util/{hash,string,shell}.go` deterministic-identifier
     hashing uses inline pure-Go SHA-1/MD5 implementations that do NOT invoke
     `crypto/sha1`/`crypto/md5`, so they remain safe under `fips140=only`. See
-    `docs/security_hardening.md` §3 for the FIPS-boundary rationale. The
+    `docs/security_hardening_fips.md` § "Non-security hash exclusions" for the FIPS-boundary rationale. The
     `GODEBUG_FIPS140` Docker build-arg parameterizes the baked default
     (`only`|`on`|`off`); customers can override at runtime via Pod env,
     Helm `operator.env`, or `kubectl set env`.

@@ -10,8 +10,8 @@ directory `release-evidence/`. To audit a different release, substitute the
 tag everywhere `0.27.1` appears and re-run; nothing else needs to change.
 
 For the policy context (what is in scope, what is not, what CMVP claim is
-being made), see [`security_hardening.md` § Release evidence — image digest,
-SBOM, build logs](security_hardening.md#release-evidence--image-digest-sbom-build-logs).
+being made), see [`security_hardening_fips.md` § Release evidence — image digest,
+SBOM, build logs](security_hardening_fips.md#release-evidence--image-digest-sbom-build-logs).
 That section is the policy; this document is the verification procedure.
 
 Required local tooling: `docker` (with the `buildx` plugin), `jq`,

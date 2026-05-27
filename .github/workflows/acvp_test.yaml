@@ -27,9 +27,10 @@
 # OUTPUTS
 #   Each job archives `acvp-evidence-<binary>-<sha>.tar.gz` containing the
 #   acvptool run log, pinned BoringSSL/testdata commit hashes, and the
-#   built binary's `go version -m` output. Per `docs/security_hardening.md`
-#   Release Gate item #12 (release evidence archival), this artifact is the
-#   reproducibility trail attached to the corresponding tagged release.
+#   built binary's `go version -m` output. Per `docs/security_hardening_fips.md`
+#   § Release evidence (release-gate evidence archival requirement), this
+#   artifact is the reproducibility trail attached to the corresponding tagged
+#   release.
 #
 # FAILURE SEMANTICS
 #   A vector mismatch fails `pkg/util/fips/acvp/run.sh` with non-zero exit

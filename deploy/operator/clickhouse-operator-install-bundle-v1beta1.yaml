@@ -5146,6 +5146,7 @@ metadata:
   namespace: kube-system
   labels:
     clickhouse.altinity.com/chop: 0.27.1
+
 # Template Parameters:
 #
 # NAMESPACE=kube-system
@@ -5398,6 +5399,7 @@ subjects:
   - kind: ServiceAccount
     name: clickhouse-operator
     namespace: kube-system
+
 # Template Parameters:
 #
 # NAMESPACE=kube-system

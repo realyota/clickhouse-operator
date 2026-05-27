@@ -5146,6 +5146,7 @@ metadata:
   namespace: ${OPERATOR_NAMESPACE}
   labels:
     clickhouse.altinity.com/chop: 0.27.1
+
 # Template Parameters:
 #
 # NAMESPACE=${OPERATOR_NAMESPACE}

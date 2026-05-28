@@ -192,7 +192,9 @@ func (r *Reconciler) recreateStatefulSet(ctx context.Context, host *api.Host, re
 	r.a.V(2).M(host).S().Info(util.NamespaceNameString(host.GetCR()))
 	defer r.a.V(2).M(host).E().Info(util.NamespaceNameString(host.GetCR()))
 
-	_ = r.doDeleteStatefulSet(ctx, host)
+	if err := r.doDeleteStatefulSet(ctx, host); err != nil {
+		return common.ErrCRUDAbort
+	}
 	_ = r.storage.ReconcilePVCs(ctx, host, api.DesiredStatefulSet)
 	return r.createStatefulSet(ctx, host, register, opts)
 }
@@ -386,9 +388,10 @@ func (r *Reconciler) shouldAbortOrContinueCreateStatefulSet(action error, host *
 		return nil
 
 	case common.ErrCRUDRecreate:
-		// Continue
-		r.a.V(1).M(host).Warning("Got recreate action. Ignore and continue for now")
-		return nil
+		// Recreate is not actionable from the create path. Treat it as failed
+		// instead of marking an uncreated StatefulSet as reconciled.
+		r.a.V(1).M(host).Warning("Got recreate action while creating StatefulSet. Abort")
+		return common.ErrCRUDAbort
 
 	case common.ErrCRUDUnexpectedFlow:
 		// Continue
@@ -410,7 +413,7 @@ func (r *Reconciler) doCreateStatefulSet(ctx context.Context, host *api.Host, op
 	log.V(1).Info("Create StatefulSet: %s", util.NamespaceNameString(statefulSet))
 	if _, err := r.sts.Create(ctx, statefulSet); err != nil {
 		log.V(1).M(host).F().Error("StatefulSet create failed. err: %v", err)
-		return common.ErrCRUDRecreate
+		return common.ErrCRUDAbort
 	}
 
 	// StatefulSet created, wait until host is launched
@@ -514,6 +517,7 @@ func (r *Reconciler) doDeleteStatefulSet(ctx context.Context, host *api.Host) er
 		// Unable to fetch cur StatefulSet, but this is not necessarily an error yet
 		if apiErrors.IsNotFound(err) {
 			log.V(1).M(host).Info("NEUTRAL not found StatefulSet %s/%s", namespace, name)
+			return nil
 		} else {
 			log.V(1).M(host).F().Error("FAIL get StatefulSet %s/%s err:%v", namespace, name, err)
 		}
@@ -539,6 +543,7 @@ func (r *Reconciler) doDeleteStatefulSet(ctx context.Context, host *api.Host) er
 		log.V(1).M(host).Info("NEUTRAL not found StatefulSet %s/%s", namespace, name)
 	} else {
 		log.V(1).M(host).F().Error("FAIL delete StatefulSet %s/%s err: %v", namespace, name, err)
+		return err
 	}
 
 	return nil

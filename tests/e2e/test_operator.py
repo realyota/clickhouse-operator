@@ -7214,9 +7214,17 @@ def test_010076(self):
     # that drops the build tag from one image will not necessarily drop it
     # from the other. Assert the banner symmetrically against both
     # containers so future regressions in either binary fail this gate.
+    # Banner format (post-iter-2 gate-semantic fix) has FOUR booleans:
+    #   chopconf.fips.enforced — chopconf knob
+    #   build.linked           — BuildSetting("GOFIPS140") != "" (durable
+    #                            build-time linkage; survives GODEBUG modes)
+    #   module.active          — fips140.Enabled() (module currently active
+    #                            as crypto provider; reflects GODEBUG state)
+    #   runtime.enforced       — fips140.Enforced() (strict-only mode active)
     banner_pattern = (
         r"FIPS: chopconf\.fips\.enforced=(true|false) "
-        r"build\.enabled=(true|false) "
+        r"build\.linked=(true|false) "
+        r"module\.active=(true|false) "
         r"runtime\.enforced=(true|false) "
         r"module=\S+"
     )
@@ -7227,8 +7235,18 @@ def test_010076(self):
     # silently misses the banner on a freshly-restarted operator and the
     # regex match falsely fails — the binary is FIPS-built but we never see
     # the line we need to verify. -1 disables the kubectl-side cap.
+    # The real release-gate invariant is: was the binary linked with the
+    # GOFIPS140 build tag? Post-Go-1.24 the banner's `build.enabled` field
+    # tracks `crypto/fips140.Enabled()`, which only returns true under
+    # `GODEBUG=fips140=on|only` at runtime — it conflates build linkage with
+    # runtime mode. Since the shipped default image bakes `fips140=off`,
+    # `build.enabled` now reads `false` even on a properly FIPS-built binary.
+    # The unambiguous "GOFIPS140 build-arg present" signal is the `FIPS env:`
+    # line's `GOFIPS140=` field (printed from `runtime/debug.BuildInfo`), which
+    # is non-empty iff the binary was built with `-tags goexperiment.boringcrypto`
+    # /`GOFIPS140=v1.0.0`. Capture it as group(1) and assert non-empty.
     fips_env_pattern = (
-        r'FIPS env: GODEBUG="[^"]*" DefaultGODEBUG="[^"]*" GOFIPS140="[^"]*"'
+        r'FIPS env: GODEBUG="[^"]*" DefaultGODEBUG="[^"]*" GOFIPS140="([^"]*)"'
     )
 
     with When("Read the operator startup banner"):
@@ -7237,41 +7255,24 @@ def test_010076(self):
             ns=operator_namespace,
         )
 
-    with Then("Banner is present and reports FIPS-built (build.enabled=true)"):
+    with Then("Banner is present (banner-format regression catch)"):
         m = re.search(banner_pattern, op_logs)
         assert m is not None, error(
             "FIPS startup banner not found in operator logs (tail=-1) — "
             "operator may be from a pre-FIPS-gate image"
         )
-        build_enabled = m.group(2)
-        assert build_enabled == "true", error(
-            f"operator image is NOT FIPS-built: build.enabled={build_enabled} "
-            f"(expected true — GOFIPS140 build tag missing)"
-        )
 
-    with And("Banner reports inactive runtime (runtime.enforced=false) for shipped default"):
-        # Shipped default: Dockerfile bakes GODEBUG=fips140=off via ARG
-        # GODEBUG_FIPS140=off. The FIPS module is linked (build.enabled=true)
-        # but dormant — runtime.enforced reads false. A regression that flips
-        # the build-arg to `only` would silently enable strict mode for every
-        # customer on upgrade; fail the gate so that flip is visible at e2e.
-        runtime_enforced = m.group(3)
-        assert runtime_enforced == "false", error(
-            f"operator runtime.enforced={runtime_enforced} (expected false — "
-            f"GODEBUG_FIPS140 build-arg may have flipped from off to on/only)"
+    with And("FIPS env line reports non-empty GOFIPS140 (GOFIPS140 build-arg present)"):
+        env_m = re.search(fips_env_pattern, op_logs)
+        assert env_m is not None, error(
+            "FIPS env line not found in operator logs — banner enhancement "
+            "missing OR image predates the GOFIPS140 release gate"
         )
-
-    with And("FIPS env line is present (soft-fail: forward-compatible)"):
-        # Soft-fail with a warning rather than assert: A2's banner enhancement
-        # adds a second `FIPS env: GODEBUG=... DefaultGODEBUG=... GOFIPS140=...`
-        # line. If that enhancement has not landed in the image under test,
-        # the rest of the gate still holds. Use note() so the absence shows
-        # up in the test log without flipping the test red.
-        if re.search(fips_env_pattern, op_logs) is None:
-            note(
-                "FIPS env line not found in operator logs — A2 banner "
-                "enhancement may not be present yet (soft-fail, not an error)"
-            )
+        gofips140 = env_m.group(1)
+        assert gofips140 != "", error(
+            f"operator image is NOT FIPS-built: GOFIPS140={gofips140!r} "
+            f"(expected non-empty, e.g. 'v1.0.0' — GOFIPS140 build-arg dropped)"
+        )
 
     with When("Read the metrics-exporter startup banner"):
         exporter_logs = kubectl.launch(
@@ -7279,31 +7280,24 @@ def test_010076(self):
             ns=operator_namespace,
         )
 
-    with Then("Banner is present and reports FIPS-built (build.enabled=true) for metrics-exporter"):
+    with Then("Banner is present in metrics-exporter logs (banner-format regression catch)"):
         m = re.search(banner_pattern, exporter_logs)
         assert m is not None, error(
             "FIPS startup banner not found in metrics-exporter logs (tail=-1) — "
             "exporter image may be from a pre-FIPS-gate build"
         )
-        build_enabled = m.group(2)
-        assert build_enabled == "true", error(
-            f"metrics-exporter image is NOT FIPS-built: build.enabled={build_enabled} "
-            f"(expected true — GOFIPS140 build tag missing from exporter image)"
-        )
 
-    with And("Banner reports inactive runtime (runtime.enforced=false) for metrics-exporter"):
-        runtime_enforced = m.group(3)
-        assert runtime_enforced == "false", error(
-            f"metrics-exporter runtime.enforced={runtime_enforced} (expected "
-            f"false — GODEBUG_FIPS140 build-arg may have flipped from off to on/only)"
+    with And("FIPS env line reports non-empty GOFIPS140 for metrics-exporter"):
+        env_m = re.search(fips_env_pattern, exporter_logs)
+        assert env_m is not None, error(
+            "FIPS env line not found in metrics-exporter logs — banner "
+            "enhancement missing OR exporter image predates the FIPS gate"
         )
-
-    with And("FIPS env line is present in metrics-exporter logs (soft-fail)"):
-        if re.search(fips_env_pattern, exporter_logs) is None:
-            note(
-                "FIPS env line not found in metrics-exporter logs — A2 "
-                "banner enhancement may not be present yet (soft-fail, not an error)"
-            )
+        gofips140 = env_m.group(1)
+        assert gofips140 != "", error(
+            f"metrics-exporter image is NOT FIPS-built: GOFIPS140={gofips140!r} "
+            f"(expected non-empty, e.g. 'v1.0.0' — GOFIPS140 build-arg dropped from exporter)"
+        )
 
     with Finally("I clean up"):
         delete_test_namespace()

@@ -395,9 +395,14 @@ posture into Enabled/Enforced booleans.
 ### E2E coverage
 
 `tests/e2e/test_operator.py::test_010076` reads the operator startup banner
-emitted by `cmd/operator/app/fips_gate.go` and fails the run if
-`build.enabled` reports `false`. The shipped image asserts the build linkage
-against the Go FIPS 140-3 module.
+emitted by `cmd/operator/app/fips_gate.go` and fails the run if the
+`FIPS env:` line reports an empty `GOFIPS140` build setting — that is the
+unambiguous "GOFIPS140 build-arg was present at link time" signal,
+independent of the runtime `GODEBUG=fips140=` mode (the shipped default is
+`off`, so `build.enabled` now reads `false` even on a properly FIPS-built
+binary; the `GOFIPS140` build setting is the stable linkage signal). The
+shipped image asserts the build linkage against the Go FIPS 140-3 module
+across both the operator and metrics-exporter containers.
 
 `tests/e2e/test_operator.py::test_010078` verifies the strict-FIPS master
 switch cannot be subverted by a per-CHI override: it applies a CHI with

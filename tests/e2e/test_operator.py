@@ -7981,6 +7981,349 @@ def test_020010(self):
         delete_test_namespace()
 
 
+@TestScenario
+@Name("test_020011. CHK cluster.secure=yes wires zk-secure Service port and Raft <secure>1</secure>")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_020011(self):
+    """Positive-path declarative-TLS assertion: a CHK with cluster.secure=yes
+    (and no FIPS chopconf) must normalize and reconcile to status=Completed.
+    The declarative flag fills host.ZKPortSecure=2281, the CR-scope Service
+    emits the zk-secure:2281 port alongside zk:2181, and Raft XML emits
+    <secure>1</secure> per <server>. Server-side <openSSL> XML and cert
+    mounts are user-supplied; this test asserts only operator-side plumbing,
+    not Keeper actually accepting TLS on 2281.
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chk_manifest = "manifests/chk/test-020011-chk-secure.yaml"
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with When("Apply CHK with cluster.secure=yes"):
+        kubectl.create_and_check(
+            manifest=chk_manifest,
+            kind="chk",
+            check={
+                "pod_count": 1,
+                "chk_status": "Completed",
+                "do_not_delete": 1,
+            },
+        )
+
+    with Then("CR-scope Service exposes both zk:2181 and zk-secure:2281"):
+        svc = kubectl.get("service", f"keeper-{chk}")
+        port_names = {p["name"] for p in svc["spec"]["ports"]}
+        assert "zk" in port_names, error(
+            f"expected plain zk port preserved, got {port_names}"
+        )
+        assert "zk-secure" in port_names, error(
+            f"expected zk-secure port on Service, got {port_names}"
+        )
+        secure_port = next(p for p in svc["spec"]["ports"] if p["name"] == "zk-secure")
+        assert secure_port["port"] == 2281, error(
+            f"expected zk-secure:2281, got {secure_port}"
+        )
+
+    with And("Common ConfigMap raft XML carries <secure>1</secure>"):
+        cm = kubectl.get("configmap", f"chk-{chk}-common-configd")
+        data = cm.get("data", {})
+        assert "chop-generated-raft.xml" in data, error(
+            f"chop-generated-raft.xml missing; ConfigMap keys: {list(data.keys())}"
+        )
+        raft_xml = data["chop-generated-raft.xml"]
+        assert "<secure>1</secure>" in raft_xml, error(
+            f"expected <secure>1</secure> in raft xml, got:\n{raft_xml}"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_020012. FIPS Strict: CHK without cluster.secure is rejected with FIPSValidationFailed reason")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_020012(self):
+    """CHK counterpart of test_020009 covering the implicit-bypass branch.
+    Under operator-level FIPS Strict (security.policy=Enforced), a CHK that
+    omits cluster.secure=yes triggers the normalizer's
+    rejectFIPSInsecureKeeperCluster gate. CHK lands in status=Aborted with
+    [FIPSValidationFailed]. Where test_020009 exercises the explicit-bypass
+    branch (security.clickhouse.tls.verify=None propagated via
+    InheritClusterSecurityFrom), this test exercises the implicit-bypass
+    branch (Secure nil → !IsTrue() catches both nil and explicit-false).
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chopconf_file = "manifests/chopconf/test-073-fips-strict-chopconf.yaml"
+    chk_manifest = "manifests/chk/test-020012-chk-fips-secure-required-bypass.yaml"
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with Given("Apply Strict FIPS chopconf and restart operator"):
+        util.apply_operator_config(chopconf_file)
+
+    with When("Apply CHK without cluster.secure"):
+        kubectl.apply(util.get_full_path(chk_manifest))
+
+    with Then("CHK lands in status=Aborted"):
+        kubectl.wait_chk_status(chk, 'Aborted')
+
+    with And("Aborted reason is [FIPSValidationFailed]"):
+        errors = kubectl.get_field('chk', chk, '.status.errors')
+        print(errors)
+        assert "FIPSValidationFailed" in errors, error(
+            f"expected [FIPSValidationFailed] reason in status.errors, got {errors}"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_020013. CHK without cluster.secure preserves insecure-only Service (back-compat)")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_020013(self):
+    """Back-compat regression sentinel. A CHK that does NOT declare
+    cluster.secure=yes (legacy default) must still reconcile to Completed
+    when no FIPS hardening is in effect. Proves the secure-flag normalizer
+    changes are dormant on non-adopters: no zk-secure port on the Service,
+    no <secure>1</secure> in Raft XML, and crExposesSecureZK()==false keeps
+    the emitted Service byte-identical to the legacy insecure-only shape.
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chk_manifest = "manifests/chk/test-020013-chk-insecure-baseline.yaml"
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with When("Apply CHK without cluster.secure (legacy default)"):
+        kubectl.create_and_check(
+            manifest=chk_manifest,
+            kind="chk",
+            check={
+                "pod_count": 1,
+                "chk_status": "Completed",
+                "do_not_delete": 1,
+            },
+        )
+
+    with Then("CR-scope Service exposes only zk:2181 (no zk-secure)"):
+        svc = kubectl.get("service", f"keeper-{chk}")
+        port_names = {p["name"] for p in svc["spec"]["ports"]}
+        assert "zk" in port_names, error(
+            f"expected plain zk port, got {port_names}"
+        )
+        assert "zk-secure" not in port_names, error(
+            f"zk-secure port must be absent without cluster.secure=yes; got {port_names}"
+        )
+
+    with And("Common ConfigMap raft XML omits <secure>1</secure>"):
+        cm = kubectl.get("configmap", f"chk-{chk}-common-configd")
+        data = cm.get("data", {})
+        assert "chop-generated-raft.xml" in data, error(
+            f"chop-generated-raft.xml missing; ConfigMap keys: {list(data.keys())}"
+        )
+        raft_xml = data["chop-generated-raft.xml"]
+        assert "<secure>1</secure>" not in raft_xml, error(
+            f"unexpected <secure>1</secure> in back-compat raft xml:\n{raft_xml}"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_020014. CHK cluster.insecure=no + secure=yes wires TLS-only listener and pgrep liveness fallback")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_020014(self):
+    """TLS-only CHK happy path. With cluster.insecure=no AND
+    cluster.secure=yes the operator must
+    suppress every plaintext client surface while preserving the secure
+    ones: the per-cluster Service drops zk:2181 entirely; STS container
+    ports drop the plaintext zk entry; the per-host overlay
+    chop-generated-listeners.xml emits <tcp_port remove="1"/> alongside
+    <tcp_port_secure>2281</tcp_port_secure> so the Keeper process binds
+    no plaintext listener at all; and the liveness probe falls back to
+    `pgrep` because upstream Keeper does not serve 4LW over TLS. Raft
+    inter-peer TLS is still wired (<secure>1</secure> per <server>).
+    Single replica keeps Raft trivially satisfied so /ready passes
+    without peer handshake — the test asserts operator-side declarative
+    plumbing only, not Keeper actually accepting TLS connections (no
+    user-supplied <openSSL> XML is provided).
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chk_manifest = "manifests/chk/test-020014-chk-tls-only.yaml"
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+    cluster = "keeper"
+    host = "0-0"
+
+    with When("Apply CHK with cluster.insecure=no + cluster.secure=yes"):
+        kubectl.create_and_check(
+            manifest=chk_manifest,
+            kind="chk",
+            check={
+                "pod_count": 1,
+                "chk_status": "Completed",
+                "do_not_delete": 1,
+            },
+        )
+
+    with Then("CR-scope Service exposes zk-secure:2281 + raft, no zk:2181"):
+        svc = kubectl.get("service", f"keeper-{chk}")
+        ports = {p["name"]: p["port"] for p in svc["spec"]["ports"]}
+        assert "zk" not in ports, error(
+            f"plaintext zk port must be absent under insecure=no; got {ports}"
+        )
+        assert ports.get("zk-secure") == 2281, error(
+            f"expected zk-secure:2281, got {ports}"
+        )
+        assert "raft" in ports, error(f"expected raft port preserved, got {ports}")
+
+    with And("STS container ports carry zk-secure + raft, NO plaintext zk"):
+        sts = kubectl.get("statefulset", f"chk-{chk}-{cluster}-{host}")
+        cports = {p["name"] for p in sts["spec"]["template"]["spec"]["containers"][0].get("ports", [])}
+        assert "zk" not in cports, error(
+            f"plaintext zk container port must be absent; got {cports}"
+        )
+        assert "zk-secure" in cports, error(f"expected zk-secure container port, got {cports}")
+
+    with And("Per-host ConfigMap listeners XML suppresses tcp_port and emits tcp_port_secure"):
+        cm = kubectl.get("configmap", f"chk-{chk}-deploy-confd-{cluster}-{host}")
+        data = cm.get("data", {})
+        assert "chop-generated-listeners.xml" in data, error(
+            f"chop-generated-listeners.xml missing; ConfigMap keys: {list(data.keys())}"
+        )
+        xml = data["chop-generated-listeners.xml"]
+        assert '<tcp_port remove="1"/>' in xml, error(
+            f"expected <tcp_port remove=\"1\"/> suppression in listeners xml:\n{xml}"
+        )
+        assert "<tcp_port_secure>2281</tcp_port_secure>" in xml, error(
+            f"expected <tcp_port_secure>2281</tcp_port_secure> in listeners xml:\n{xml}"
+        )
+
+    with And("Liveness probe falls back to pgrep (4LW unavailable over TLS)"):
+        sts = kubectl.get("statefulset", f"chk-{chk}-{cluster}-{host}")
+        cmd = sts["spec"]["template"]["spec"]["containers"][0]["livenessProbe"]["exec"]["command"]
+        assert cmd[0] == "pgrep", error(
+            f"expected pgrep liveness for secure-only host, got {cmd}"
+        )
+
+    with And("Raft XML still carries <secure>1</secure> per <server>"):
+        cm = kubectl.get("configmap", f"chk-{chk}-common-configd")
+        raft_xml = cm.get("data", {}).get("chop-generated-raft.xml", "")
+        assert "<secure>1</secure>" in raft_xml, error(
+            f"expected <secure>1</secure> in raft xml under secure=yes:\n{raft_xml}"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_020015. NoKeeperListener: CHK with insecure=no and secure unset is aborted on reconcile")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_020015(self):
+    """Admission gate. A CHK whose cluster declares insecure=no
+    without an offsetting secure=yes would emit a Service with no
+    client-facing Keeper port — ClickHouse clients could not reach it.
+    The normalizer's rejectNoKeeperListener gate catches this
+    unconditionally (no FIPS chopconf required) and aborts the CHK with
+    StatusReasonNoKeeperListener. The abort message names the offending
+    cluster so users can locate it in multi-cluster CHKs.
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chk_manifest = "manifests/chk/test-020015-chk-no-keeper-listener.yaml"
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with When("Apply CHK with cluster.insecure=no and cluster.secure unset"):
+        kubectl.apply(util.get_full_path(chk_manifest))
+
+    with Then("CHK lands in status=Aborted"):
+        kubectl.wait_chk_status(chk, 'Aborted')
+
+    with And("Aborted reason is [NoKeeperListener]"):
+        errors = kubectl.get_field('chk', chk, '.status.errors')
+        print(errors)
+        assert "NoKeeperListener" in errors, error(
+            f"expected [NoKeeperListener] reason in status.errors, got {errors}"
+        )
+        assert "keeper" in errors, error(
+            f"expected offending cluster name in status.errors, got {errors}"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_020016. Legacy CHK with neither secure nor insecure preserves pre-knob byte-identity")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_020016(self):
+    """Back-compat sentinel. A CHK that declares NEITHER
+    cluster.secure NOR cluster.insecure (the legacy default shape) must
+    produce byte-identical output to the pre-knob release: the
+    per-cluster Service exposes zk:2181 + raft (no zk-secure); STS
+    container ports include zk + raft (no zk-secure); the per-host
+    ConfigMap does NOT contain chop-generated-listeners.xml; the
+    liveness probe uses the bash /dev/tcp ruok handshake (NOT the
+    pgrep fallback). Any divergence here is a back-compat regression
+    for every existing CHK in the field on upgrade.
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chk_manifest = "manifests/chk/test-020016-chk-legacy-default.yaml"
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+    cluster = "keeper"
+    host = "0-0"
+
+    with When("Apply legacy CHK (neither cluster.secure nor cluster.insecure)"):
+        kubectl.create_and_check(
+            manifest=chk_manifest,
+            kind="chk",
+            check={
+                "pod_count": 1,
+                "chk_status": "Completed",
+                "do_not_delete": 1,
+            },
+        )
+
+    with Then("CR-scope Service exposes zk:2181 + raft, no zk-secure"):
+        svc = kubectl.get("service", f"keeper-{chk}")
+        port_names = {p["name"] for p in svc["spec"]["ports"]}
+        assert "zk" in port_names, error(f"expected zk port, got {port_names}")
+        assert "zk-secure" not in port_names, error(
+            f"zk-secure must be absent for legacy CHK; got {port_names}"
+        )
+
+    with And("STS container ports include zk + raft, no zk-secure"):
+        sts = kubectl.get("statefulset", f"chk-{chk}-{cluster}-{host}")
+        cports = {p["name"] for p in sts["spec"]["template"]["spec"]["containers"][0].get("ports", [])}
+        assert "zk" in cports, error(f"expected zk container port, got {cports}")
+        assert "zk-secure" not in cports, error(
+            f"zk-secure container port must be absent for legacy CHK; got {cports}"
+        )
+
+    with And("Per-host ConfigMap omits chop-generated-listeners.xml"):
+        cm = kubectl.get("configmap", f"chk-{chk}-deploy-confd-{cluster}-{host}")
+        data = cm.get("data", {})
+        assert "chop-generated-listeners.xml" not in data, error(
+            "chop-generated-listeners.xml must be absent when both cluster.secure and "
+            f"cluster.insecure are unset; ConfigMap keys: {list(data.keys())}"
+        )
+
+    with And("Liveness probe uses bash /dev/tcp ruok (NOT pgrep fallback)"):
+        sts = kubectl.get("statefulset", f"chk-{chk}-{cluster}-{host}")
+        cmd = sts["spec"]["template"]["spec"]["containers"][0]["livenessProbe"]["exec"]["command"]
+        assert (len(cmd) == 3) and (cmd[0] == "bash") and (cmd[1] == "-c"), error(
+            f"expected ['bash','-c',<ruok script>] liveness, got {cmd}"
+        )
+        assert "ruok" in cmd[2], error(
+            f"expected ruok in liveness script, got: {cmd[2]}"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
 def cleanup_chis(self):
     with Given("Cleanup CHIs"):
         ns = kubectl.get("ns", name="", ns="--all-namespaces", ok_to_fail=True)

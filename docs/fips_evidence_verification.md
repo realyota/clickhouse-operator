@@ -207,43 +207,29 @@ FIPS: chopconf.fips.enforced=<bool> build.enabled=<bool> runtime.enforced=<bool>
 that `go version -m` exposes statically. `tests/e2e/test_operator.py::test_010076`
 asserts this banner on every CI run.
 
-## 6. Verify ACVP-evidence artifact
+## 6. Verify ACVP-evidence artifact (local-only)
 
-`.github/workflows/acvp_test.yaml` runs BoringSSL's `acvptool` against
-each shipped binary's NIST ACVP responder and uploads
-`acvp-evidence-<bin>-<sha>.tar.gz` per build. Retention is 90 days.
+ACVP responder evidence is produced by `pkg/util/fips/acvp/run.sh`, which
+drives BoringSSL's `acvptool` against each shipped binary's NIST ACVP
+responder. There is no CI workflow that uploads the artifact today;
+reviewers and release engineers run the driver locally on the release
+commit and archive the output alongside the rest of the per-release
+evidence bundle. The driver fails non-zero on any vector mismatch, so a
+green local run is itself the pass/fail manifest.
 
-Download from the workflow run associated with the release commit:
-
-```bash
-gh run list --repo Altinity/clickhouse-operator \
-  --workflow acvp_test.yaml --branch 0.27.1 --limit 1
-gh run download <run-id> --repo Altinity/clickhouse-operator \
-  --name acvp-evidence-clickhouse-operator-<sha>
-gh run download <run-id> --repo Altinity/clickhouse-operator \
-  --name acvp-evidence-metrics-exporter-<sha>
-```
-
-Each tarball contains:
-
-- `acvp-out/` — the BoringSSL `acvptool` run log with pinned BoringSSL
-  and `geomys/acvp-testdata` commit hashes. The driver
-  (`pkg/util/fips/acvp/run.sh`) fails non-zero on any vector mismatch,
-  so a green workflow run is itself the pass/fail manifest. The run
-  log records each algorithm dispatched and its result.
-- `dev/bin/<bin>.gobuildinfo.txt` — the binary's `go version -m`
-  output captured at ACVP-run time, which includes the `GOFIPS140`
-  build tag. This proves the binary subjected to the test vectors
-  was linked against the same FIPS module that ships in the image.
-
-Inspect:
+Reproduce per binary:
 
 ```bash
-tar -tzf acvp-evidence-clickhouse-operator-<sha>.tar.gz
-tar -xzf acvp-evidence-clickhouse-operator-<sha>.tar.gz
-grep GOFIPS140 dev/bin/clickhouse-operator.gobuildinfo.txt
-grep -E 'PASS|FAIL' acvp-out/*.log
+GOFIPS140=v1.0.0 go build -tags acvp_wrapper \
+  -o dev/bin/clickhouse-operator ./cmd/operator
+pkg/util/fips/acvp/run.sh dev/bin/clickhouse-operator
+go version -m dev/bin/clickhouse-operator | grep GOFIPS140
 ```
+
+The pinned BoringSSL and `geomys/acvp-testdata` commits live in
+`pkg/util/fips/acvp/run.sh` so the run is bit-for-bit reproducible across
+hosts. `go version -m` proves the binary subjected to the test vectors
+was linked against the same FIPS module that ships in the image.
 
 The expected pattern is a long run of `PASS` lines and zero `FAIL` lines.
 For wrapper internals and a procedure to reproduce the vector run

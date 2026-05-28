@@ -1176,6 +1176,12 @@ func (n *Normalizer) resolveTLSRootCASecretRef(tls *chi.ClusterSecurityClickHous
 		value, err := subst.FetchSecretFieldValue(addr, n.secretGet)
 		if err == nil {
 			tls.RootCA = value
+			// Drop the ref now that we've inlined its content. Otherwise the
+			// ancestor re-normalize on the next reconcile (via
+			// InheritClusterSecurityFrom → MergeFrom) would re-inject the ref
+			// alongside the resolved inline RootCA and trip the front-door
+			// RootCAConflict gate above.
+			tls.RootCASecretRef = nil
 			return
 		}
 		lastErr = err

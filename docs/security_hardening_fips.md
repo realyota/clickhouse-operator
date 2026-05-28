@@ -259,15 +259,17 @@ deployment. Mitigations:
 
 ### Where outputs land
 
-The [`acvp_test.yaml`](../.github/workflows/acvp_test.yaml) GitHub Actions
-workflow runs the driver against both binaries on every push to `master`
-and on PRs that touch the wrapper, the `cmd/` entrypoints, or the
-dockerfiles. Each run uploads `acvp-evidence-<binary>-<sha>.tar.gz`
-containing the BoringSSL `acvptool` run log, the pinned BoringSSL and
-testdata commits, and the binary's `go version -m` output. This artifact is
-the per-release reproducibility trail that the release-gate evidence-archival
-requirement expects — see `pkg/util/fips/acvp/README.md` for the wrapper's
-local-reproduction instructions and pinned upstream commits.
+The driver lives at `pkg/util/fips/acvp/run.sh` and is reproduced locally
+against both binaries (`clickhouse-operator` and `metrics-exporter`) for
+each release. There is no CI workflow that uploads an evidence artifact
+today; the driver fails non-zero on any vector mismatch, so a green local
+run is itself the pass/fail manifest. The pinned BoringSSL and
+`geomys/acvp-testdata` commits in `run.sh` keep the run bit-for-bit
+reproducible across hosts. The captured run log + the binary's
+`go version -m` output form the per-release reproducibility trail that
+the release-gate evidence-archival requirement expects — see
+`pkg/util/fips/acvp/README.md` for the wrapper's local-reproduction
+instructions and pinned upstream commits.
 
 ## FIPS build
 
@@ -609,11 +611,11 @@ retention of the release itself and serve as the longer-lived copy.
 
 #### PR-time validation
 
-`.github/workflows/release_evidence_smoketest.yaml` runs on every pull
-request that touches an evidence-relevant input (Dockerfiles, build
-scripts under `dev/`, and the release orchestrator). It exercises the
-digest, SBOM, manifest, and metadata steps end-to-end so the pipeline
-cannot silently regress between releases.
+The release-evidence pipeline is validated locally by running
+`dev/release_evidence.sh` on a release-candidate tag; there is no CI
+smoketest. Reviewers touching Dockerfiles, build scripts under `dev/`,
+or the release orchestrator should run the script manually and confirm
+the digest, SBOM, manifest, and metadata steps complete end-to-end.
 
 ## Related
 

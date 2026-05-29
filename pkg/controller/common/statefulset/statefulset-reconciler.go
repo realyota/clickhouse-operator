@@ -193,8 +193,21 @@ func (r *Reconciler) recreateStatefulSet(ctx context.Context, host *api.Host, re
 	defer r.a.V(2).M(host).E().Info(util.NamespaceNameString(host.GetCR()))
 
 	if err := r.doDeleteStatefulSet(ctx, host); err != nil {
-		r.a.V(1).M(host).Warning(
-			"Recreate deferred: StatefulSet delete failed: %v - will retry on next reconcile", err)
+		namespace := host.Runtime.Address.Namespace
+		name := r.namer.Name(interfaces.NameStatefulSet, host)
+		// Stable K8s Event/Status message (no err interpolation) so event-recorder dedupe
+		// aggregates repeated failures into a single event with bumped Count instead of
+		// minting a new row each reconcile cycle.
+		r.a.V(1).
+			WithEvent(host.GetCR(), a.EventActionUpdate, a.EventReasonUpdateFailed).
+			WithAction(host.GetCR()).
+			WithError(host.GetCR()).
+			M(host).F().
+			Warning("Recreate aborted: StatefulSet delete failed %s/%s", namespace, name)
+		// Verbose err detail goes to the log only, not the K8s Event.
+		log.V(1).M(host).F().Error("Recreate aborted: StatefulSet delete failed %s/%s err: %v", namespace, name, err)
+		// Recovery is informer-driven: a subsequent spec edit, STS/Pod event, or the periodic
+		// resync will re-enqueue this CR. Host stays at Replicas=0 until then.
 		return err
 	}
 	_ = r.storage.ReconcilePVCs(ctx, host, api.DesiredStatefulSet)
@@ -390,9 +403,17 @@ func (r *Reconciler) shouldAbortOrContinueCreateStatefulSet(action error, host *
 		return nil
 
 	case common.ErrCRUDRecreate:
-		// Continue
-		r.a.V(1).M(host).Warning("Got recreate action. Ignore and continue for now")
-		return nil
+		// Do NOT silently swallow as nil — doing so caused doomed reconciles
+		// (e.g. AlreadyExists from a stale-informer race or a prior failed
+		// delete) to be reported as success. Propagate the sentinel so the
+		// caller's failure branch runs and the next reconcile retries.
+		r.a.WithEvent(host.GetCR(), a.EventActionCreate, a.EventReasonCreateFailed).
+			WithAction(host.GetCR()).
+			WithError(host.GetCR()).
+			M(host).F().
+			Error("Create StatefulSet: %s - failed and needs recreate; propagating as error",
+				util.NamespaceNameString(statefulSet))
+		return common.ErrCRUDRecreate
 
 	case common.ErrCRUDUnexpectedFlow:
 		// Continue
@@ -413,7 +434,12 @@ func (r *Reconciler) doCreateStatefulSet(ctx context.Context, host *api.Host, op
 
 	log.V(1).Info("Create StatefulSet: %s", util.NamespaceNameString(statefulSet))
 	if _, err := r.sts.Create(ctx, statefulSet); err != nil {
-		log.V(1).M(host).F().Error("StatefulSet create failed. err: %v", err)
+		if apiErrors.IsAlreadyExists(err) {
+			log.V(1).M(host).F().Error(
+				"StatefulSet create failed - already exists (stale informer or prior failed delete). err: %v", err)
+		} else {
+			log.V(1).M(host).F().Error("StatefulSet create failed. err: %v", err)
+		}
 		return common.ErrCRUDRecreate
 	}
 
@@ -500,7 +526,7 @@ func (r *Reconciler) doUpdateStatefulSet(
 	return nil
 }
 
-// deleteStatefulSet gracefully deletes StatefulSet through zeroing Pod's count.
+// doDeleteStatefulSet gracefully deletes StatefulSet through zeroing Pod's count.
 // Scale-to-0 is best-effort; failures (e.g. 409 Conflict) must not block Delete.
 func (r *Reconciler) doDeleteStatefulSet(ctx context.Context, host *api.Host) error {
 	// IMPORTANT
@@ -526,29 +552,30 @@ func (r *Reconciler) doDeleteStatefulSet(ctx context.Context, host *api.Host) er
 	}
 
 	// Scale cur host's StatefulSet down to 0 pods count - graceful path.
-	// On failure, fall through to Delete which will terminate pods anyway.
 	cur := host.Runtime.CurStatefulSet
 	if cur.Spec.Replicas == nil || *cur.Spec.Replicas != 0 {
 		var zero int32 = 0
 		cur.Spec.Replicas = &zero
-		if _, uerr := r.sts.Update(ctx, cur); uerr != nil {
-			log.V(1).M(host).Warning(
+		// INTENTIONAL: fall through to Delete on Update failure.
+		if _, err := r.sts.Update(ctx, cur); err != nil {
+			log.V(1).M(host).F().Warning(
 				"Scale-to-0 update failed for StatefulSet %s/%s (%v) - proceeding to Delete",
-				namespace, name, uerr)
+				namespace, name, err)
 		} else {
 			// Wait until StatefulSet scales down to 0 pods count.
 			_ = r.hostObjectsPoller.WaitHostStatefulSetReady(ctx, host)
 		}
+	} else {
+		log.V(1).M(host).Info("StatefulSet %s/%s already at Replicas=0, skipping scale-down", namespace, name)
 	}
 
-	// Delete StatefulSet
-	if derr := r.sts.Delete(ctx, namespace, name); derr != nil {
-		if apiErrors.IsNotFound(derr) {
+	if err := r.sts.Delete(ctx, namespace, name); err != nil {
+		if apiErrors.IsNotFound(err) {
 			log.V(1).M(host).Info("NEUTRAL not found StatefulSet %s/%s", namespace, name)
 			return nil
 		}
-		log.V(1).M(host).F().Error("FAIL delete StatefulSet %s/%s err: %v", namespace, name, derr)
-		return derr
+		log.V(1).M(host).F().Error("FAIL delete StatefulSet %s/%s err: %v", namespace, name, err)
+		return err
 	}
 	log.V(1).M(host).Info("OK delete StatefulSet %s/%s", namespace, name)
 	return nil

@@ -816,6 +816,56 @@ This is intentionally a Deployment-level escape hatch, not a CRD field — the
 IPC token is operator-internal trust material and users who don't need this
 should keep the default `emptyDir` flow.
 
+## Certificates and CA trust
+
+FIPS and strict-TLS deployments typically store server material in a Kubernetes
+Secret (the [`fips_setup.md`](./fips_setup.md) examples use
+`clickhouse-certs`):
+
+```text
+server.crt
+server.key
+ca.crt
+dhparam.pem
+```
+
+The server certificate must contain Subject Alternative Names for the DNS names
+used by the operator and by ClickHouse/Keeper clients. For example, ClickHouse
+host certificates must cover names like:
+
+```text
+chi-<chi-name>-default-0-0.<namespace>.svc.cluster.local
+chi-<chi-name>-default-0-1.<namespace>.svc.cluster.local
+```
+
+Keeper certificates must cover names like:
+
+```text
+chk-<keeper-name>-keeper-0-0.<namespace>.svc.cluster.local
+chk-<keeper-name>-keeper-0-1.<namespace>.svc.cluster.local
+```
+
+This matters because `verify: Strict` validates both the CA chain and hostname.
+A certificate that is trusted but missing the Kubernetes DNS SAN will fail
+hostname validation. See also the Debug section below for SAN mismatch
+troubleshooting.
+
+The ClickHouseInstallation tells the operator which CA to trust:
+
+```yaml
+spec:
+  security:
+    clickhouse:
+      tls:
+        rootCASecretRef:
+          name: clickhouse-certs
+          key: ca.crt
+```
+
+This CA is used by the operator when it connects to ClickHouse over HTTPS.
+Alternatively, paste the PEM into `security.clickhouse.tls.rootCA` at the
+chopconf or CHI level (see `security.clickhouse.tls.rootCA` above).
+
 ## Setup
 
 The toggles below are pure CR fields. No new images, no new RBAC.
@@ -1080,6 +1130,7 @@ separate axis (`security.fips.enforced`), documented in
 ## Related
 
 - FIPS-specific controls (cryptographic-module gate, image policy, ACVP, FIPS build, release evidence): [`security_hardening_fips.md`](./security_hardening_fips.md)
+- End-to-end FIPS deployment: [`fips_setup.md`](./fips_setup.md)
 - Per-release verification recipes (digest / SBOM / cosign): [`fips_evidence_verification.md`](./fips_evidence_verification.md)
 - Concrete YAML examples: `docs/chi-examples/24-security-*.yaml`
 - Operator-config surface: `docs/chi-examples/70-chop-config.yaml`

@@ -2,9 +2,9 @@
 
 This document presents a reference deployment of the ClickHouse Operator in a
 FIPS-compatible posture: FIPS-built images, secure ports only, and verified TLS
-between every component. It walks through the four example manifests that make
-up the deployment and highlights the main FIPS-related option in each. The
-cryptographic-module gate, image policy, and release evidence are covered in
+between every component. It walks through the example manifests and highlights
+the main FIPS-related option in each. The cryptographic-module gate, image
+policy, and release evidence are covered in
 [`security_hardening_fips.md`](./security_hardening_fips.md); the general TLS
 knobs and certificate setup are covered in
 [`security_hardening.md`](./security_hardening.md).
@@ -18,9 +18,9 @@ Prometheus metrics endpoints (operator `:9999`, metrics-exporter
 mutual TLS, because the operator has no client-certificate settings for its
 health and version connections to ClickHouse.
 
-## Order of apply
+## Shared prerequisites
 
-Apply the manifests in this order:
+Apply these before either ClickHouse cluster variant:
 
 1. [`25-fips-01-chopconf.yaml`](chi-examples/25-fips-01-chopconf.yaml) — operator
    configuration.
@@ -28,12 +28,42 @@ Apply the manifests in this order:
    [`security_hardening.md`](./security_hardening.md#certificates-and-ca-trust).
 3. [`31-fips-secure-cluster.yaml`](chk-examples/31-fips-secure-cluster.yaml) —
    Keeper cluster.
-4. [`25-fips-02-cluster.yaml`](chi-examples/25-fips-02-cluster.yaml) and
-   [`107-fips-backup-sidecar.yaml`](chit-examples/107-fips-backup-sidecar.yaml) —
-   ClickHouse cluster and its backup template.
 
-The backup template (CHIT) must exist before or alongside the ClickHouse
-cluster, which pulls it in through `useTemplates`.
+## ClickHouse cluster variants
+
+Two example manifests cover the same TLS-only cluster configuration. 
+
+| Variant | Manifest(s) | When to use |
+| ------- | ----------- | ----------- |
+| **ClickHouse only** | [`25-fips-02-cluster.yaml`](chi-examples/25-fips-02-cluster.yaml) | Single self-contained CHI: FIPS image and pod template are inline; no sidecar. |
+| **With backup sidecar** | [`25-fips-03-cluster-with-backup.yaml`](chi-examples/25-fips-03-cluster-with-backup.yaml) plus [`107-fips-backup-sidecar.yaml`](chit-examples/107-fips-backup-sidecar.yaml) | Reusable CHIT defines the full pod (FIPS ClickHouse + FIPS `clickhouse-backup`); CHI pulls it in via `useTemplates`. |
+
+
+### ClickHouse only
+
+Apply after the shared prerequisites:
+
+```text
+kubectl apply -f chi-examples/25-fips-02-cluster.yaml
+```
+
+The CHI sets `defaults.templates.podTemplate: fips` and defines pod template
+`fips` with the FIPS-built `altinity/clickhouse-server` image.
+
+### With backup sidecar
+
+Apply the backup template before or alongside the cluster CHI:
+
+```text
+kubectl apply -f chit-examples/107-fips-backup-sidecar.yaml
+kubectl apply -f chi-examples/25-fips-03-cluster-with-backup.yaml
+```
+
+The CHIT (`clickhouse-fips-backup-template`) supplies pod template `fips`
+(clickhouse + clickhouse-backup containers, backup TLS env, and volumes). The
+CHI references it through `useTemplates`. The `podTemplate` name in
+`defaults.templates` must match `templates.podTemplates[].name` in the CHIT
+(both are `fips`).
 
 ## Operator configuration
 
@@ -50,11 +80,11 @@ spec:
       enforced: "true"
 ```
 
-## ClickHouse cluster
+## ClickHouse TLS configuration
 
-[`25-fips-02-cluster.yaml`](chi-examples/25-fips-02-cluster.yaml) runs ClickHouse
-on secure ports only. The plain-text ports are removed and replaced by their TLS
-equivalents, and the cluster trusts the shared CA through `rootCASecretRef`.
+Both cluster manifests run ClickHouse on secure ports only. Plain-text ports
+are removed and replaced by TLS equivalents; the cluster trusts the shared CA
+through `rootCASecretRef`.
 
 ```yaml
 settings:
@@ -68,10 +98,13 @@ settings:
   interserver_https_port: 9010
 ```
 
-The `openssl.xml` file pins both the server and client to 1.3 and a
-FIPS-approved cipher suite. The server presents its certificate without
-requesting one from clients (`verificationMode: none`), while the client side
-validates the server against the mounted CA in strict mode.
+The `openssl.xml` file allows TLS 1.2 and 1.3 on both the server and client
+sides with FIPS-approved cipher suites. While external clients may connect using
+either protocol version, the operator enforces TLS 1.3 for its outbound
+connections, ensuring all operator-to-ClickHouse communication uses TLS 1.3
+exclusively. The server presents its certificate without requesting one from
+clients (`verificationMode: none`), while the client side validates the server
+against the mounted CA in strict mode.
 
 ```xml
 <client>
@@ -88,7 +121,8 @@ validates the server against the mounted CA in strict mode.
 [`31-fips-secure-cluster.yaml`](chk-examples/31-fips-secure-cluster.yaml) runs
 ClickHouse Keeper on a FIPS-built image with TLS-only ports. Setting
 `secure: "yes"` and `insecure: "no"` drops the plain-text client port 2181,
-opens the secure client port 2281, and secures the Raft traffic between Keeper nodes.
+opens the secure client port 2281, and secures the Raft traffic between Keeper
+nodes.
 
 ```yaml
 clusters:
@@ -105,9 +139,11 @@ pulls its image from `altinity/clickhouse-keeper:<ver>.altinityfips`.
 ## Backup sidecar
 
 [`107-fips-backup-sidecar.yaml`](chit-examples/107-fips-backup-sidecar.yaml) is
-the template that supplies the FIPS-built ClickHouse and clickhouse-backup
-images. The backup container serves its API over HTTPS and connects to
-ClickHouse over the secure native port with CA verification enabled.
+the `ClickHouseInstallationTemplate` used by
+[`25-fips-03-cluster-with-backup.yaml`](chi-examples/25-fips-03-cluster-with-backup.yaml).
+It defines pod template `fips` with the FIPS-built ClickHouse and
+`clickhouse-backup` images. The backup container serves its API over HTTPS and
+connects to ClickHouse over the secure native port with CA verification enabled.
 
 ```yaml
 - name: CLICKHOUSE_SECURE

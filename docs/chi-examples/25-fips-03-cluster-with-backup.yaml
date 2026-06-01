@@ -3,23 +3,14 @@ kind: "ClickHouseInstallation"
 metadata:
   name: clickhouse-fips
 spec:
-  defaults:
-    templates:
-      podTemplate: fips
-  templates:
-    podTemplates:
-      - name: fips
-        spec:
-          containers:
-            - name: clickhouse
-              image: altinity/clickhouse-server:25.3.8.30001.altinityfips
-              imagePullPolicy: IfNotPresent
   security:
     clickhouse:
       tls:
         rootCASecretRef:
           name: clickhouse-certs
           key: ca.crt
+  useTemplates:
+    - name: clickhouse-fips-backup-template
   configuration:
     clusters:
       - name: default

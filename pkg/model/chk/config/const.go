@@ -76,4 +76,9 @@ const (
 	configRaft      = "raft"
 	configSettings  = "settings"
 	configListeners = "listeners"
+	// configListenersCommon is the common-group (keeper_config.d) overlay that
+	// removes the static plaintext <tcp_port>; it must live alongside the
+	// definition it deletes, not in the per-host conf.d. See
+	// Generator.getPlaintextListenerRemoval.
+	configListenersCommon = "common-listeners"
 )

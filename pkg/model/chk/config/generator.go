@@ -106,45 +106,80 @@ func (c *Generator) getHostServerId(host *chi.Host) string {
 	return chi.NewSettings().Set("keeper_server/server_id", chi.MustNewSettingScalarFromAny(getServerId(host))).ClickHouseConfig()
 }
 
-// getHostListenersOverride builds a per-host XML overlay that suppresses or
-// enables Keeper's client-facing listeners according to the resolved
-// host.IsInsecure() / host.IsSecure() pair. Emits nothing when the host stays
-// on the legacy default (insecure exposed, secure absent) so existing CHKs
-// see byte-identical configmap content on upgrade.
+// getHostListenersOverride builds a per-host XML overlay that opens Keeper's
+// secure client-facing listener. Emits nothing when the host stays on the
+// legacy default (insecure exposed, secure absent) so existing CHKs see
+// byte-identical configmap content on upgrade.
 //
 // Semantics:
-//   - host.IsInsecure() == false: drop `<tcp_port>` via the `remove="1"`
-//     preprocessor directive so the Keeper process binds no plaintext listener.
-//     The default overlay file
-//     (config/chk/keeper_config.d/01-keeper-01-default-config.xml)
-//     ships an unconditional `<tcp_port>2181</tcp_port>` — without this
-//     override the plaintext listener would still bind even after K8s-level
-//     closure of the Service port.
 //   - host.IsSecure() == true: emit `<tcp_port_secure>` so Keeper opens the
 //     TLS port. The user-supplied `<openSSL>` server XML (settings or files)
 //     is responsible for the TLS handshake; the operator just opens the port.
 //
-// The `remove="1"` attribute requires raw XML emission (Settings cannot
-// express XML attributes), so the body is hand-assembled and embedded.
+// This file lands in the per-host config dir (conf.d, DirPathConfigHost). The
+// secure port is per-host (PortDistributionClusterScopeIndex offsets
+// host.ZKPortSecure per replica), so it must stay host-scoped here rather than
+// in the shared common configmap. Adding `<tcp_port_secure>` is purely
+// additive — no file in keeper_config.d defines it — so a per-host override
+// merges cleanly.
+//
+// The plaintext-port REMOVAL is NOT emitted here: a `<tcp_port remove="1"/>`
+// placed in conf.d cannot delete the static `<tcp_port>2181</tcp_port>` that
+// the default overlay (keeper_config.d/01-keeper-01-default-config.xml) ships
+// in keeper_config.d — Keeper merges keeper_config.d after conf.d, so the
+// static port is re-added after the conf.d removal runs. The removal therefore
+// lives in the common group alongside the definition it deletes; see
+// getPlaintextListenerRemoval.
 func (c *Generator) getHostListenersOverride(host *chi.Host) string {
 	if host == nil {
 		return ""
 	}
-	body := &bytes.Buffer{}
-	emit := false
-	// Indent 8 = children of <keeper_server> (depth 2: clickhouse/keeper_server/<child>).
-	// Matches the indent convention used by getRaftConfig for analogous depth.
-	if !host.IsInsecure() {
-		util.Iline(body, 8, `<tcp_port remove="1"/>`)
-		emit = true
-	}
-	if host.IsSecure() && host.ZKPortSecure.HasValue() {
-		util.Iline(body, 8, "<tcp_port_secure>%d</tcp_port_secure>", host.ZKPortSecure.Value())
-		emit = true
-	}
-	if !emit {
+	if !(host.IsSecure() && host.ZKPortSecure.HasValue()) {
 		return ""
 	}
+	body := &bytes.Buffer{}
+	// Indent 8 = children of <keeper_server> (depth 2: clickhouse/keeper_server/<child>).
+	// Matches the indent convention used by getRaftConfig for analogous depth.
+	util.Iline(body, 8, "<tcp_port_secure>%d</tcp_port_secure>", host.ZKPortSecure.Value())
+	return chi.NewSettings().
+		Set("keeper_server", chi.MustNewSettingScalarFromAny(body).SetEmbed()).
+		ClickHouseConfig()
+}
+
+// getPlaintextListenerRemoval emits a common-group overlay that deletes the
+// static `<tcp_port>2181</tcp_port>` shipped by
+// keeper_config.d/01-keeper-01-default-config.xml, so a fully-secure Keeper
+// binds no plaintext client listener.
+//
+// It MUST land in the common config dir (keeper_config.d, DirPathConfigCommon),
+// the same directory as the static definition it removes: the `remove="1"`
+// preprocessor directive only wins when it is merged after the definition, and
+// Keeper merges keeper_config.d after the per-host conf.d. (The user-confirmed
+// workaround — `keeper_server/tcp_port: _removed_` as a CR setting — works for
+// exactly this reason: CR settings render into keeper_config.d.)
+//
+// The removal is CR-global (the common configmap is shared by every pod), so it
+// is emitted only when EVERY host has its plaintext port closed (!IsInsecure()).
+// For the legacy default (insecure exposed) it returns "" and no file is
+// emitted, preserving byte-identical configmap content on upgrade.
+func (c *Generator) getPlaintextListenerRemoval() string {
+	anyHost := false
+	allPlaintextClosed := true
+	c.cr.WalkHosts(func(host *chi.Host) error {
+		anyHost = true
+		// A nil host carries no posture; treat it conservatively as "not closed"
+		// so a phantom host never causes the plaintext port to be stripped.
+		if host == nil || host.IsInsecure() {
+			allPlaintextClosed = false
+		}
+		return nil
+	})
+	if !anyHost || !allPlaintextClosed {
+		return ""
+	}
+	body := &bytes.Buffer{}
+	// Indent 8 = children of <keeper_server> (depth 2: clickhouse/keeper_server/<child>).
+	util.Iline(body, 8, `<tcp_port remove="1"/>`)
 	return chi.NewSettings().
 		Set("keeper_server", chi.MustNewSettingScalarFromAny(body).SetEmbed()).
 		ClickHouseConfig()

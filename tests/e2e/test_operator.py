@@ -7981,6 +7981,27 @@ def test_020010(self):
         delete_test_namespace()
 
 
+def keeper_merged_config(chk, cluster="keeper", replica="0-0-0"):
+    """Return the EFFECTIVE merged keeper_config.xml from the running Keeper pod.
+
+    Keeper writes the post-merge result (keeper_config.d merged AFTER conf.d)
+    to <data_dir>/preprocessed_configs/. This is the ONLY layer where the
+    plaintext-port removal can be observed actually winning: the source
+    ConfigMap carries <tcp_port remove="1"/> even when the merge ignores it, so
+    asserting on the source XML cannot catch the merge-order regression.
+    Path-robust against version drift via a find fallback over the data dir;
+    a missing file makes cat fail loudly (kubectl.launch asserts), never a
+    silent empty-string false pass.
+    """
+    pod = f"chk-{chk}-{cluster}-{replica}"
+    return kubectl.launch(
+        f"exec {pod} -- bash -c '"
+        'f=/var/lib/clickhouse-keeper/preprocessed_configs/keeper_config.xml; '
+        '[ -s "$f" ] || f=$(find /var/lib/clickhouse-keeper -name keeper_config.xml -path "*preprocessed*" 2>/dev/null | head -1); '
+        'cat "$f"\''
+    )
+
+
 @TestScenario
 @Name("test_020011. CHK cluster.secure=yes wires zk-secure Service port and Raft <secure>1</secure>")
 @Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
@@ -8032,6 +8053,20 @@ def test_020011(self):
         raft_xml = data["chop-generated-raft.xml"]
         assert "<secure>1</secure>" in raft_xml, error(
             f"expected <secure>1</secure> in raft xml, got:\n{raft_xml}"
+        )
+
+    with And("MERGED keeper config STILL binds plaintext 2181 (removal is conditional, not over-applied)"):
+        # secure=yes but insecure left exposed (default) -> the plaintext port
+        # must be PRESERVED. This is the positive counterpart to test_020014's
+        # negative: it proves getPlaintextListenerRemoval fires only when every
+        # host is non-insecure, never stripping 2181 from a still-insecure CR.
+        pod = f"chk-{chk}-keeper-0-0-0"
+        alive = kubectl.launch(f"exec {pod} -- bash -c 'pgrep -f clickhouse-keeper | wc -l'").strip()
+        assert int(alive) >= 1, error(f"keeper process not alive (pgrep={alive})")
+        merged = keeper_merged_config(chk)
+        assert "<tcp_port>2181</tcp_port>" in merged, error(
+            "plaintext <tcp_port>2181</tcp_port> must be preserved when insecure is still "
+            f"exposed (removal must not over-apply). Merged config:\n{merged}"
         )
 
     with Finally("I clean up"):
@@ -8138,8 +8173,11 @@ def test_020014(self):
     suppress every plaintext client surface while preserving the secure
     ones: the per-cluster Service drops zk:2181 entirely; STS container
     ports drop the plaintext zk entry; the per-host overlay
-    chop-generated-listeners.xml emits <tcp_port remove="1"/> alongside
-    <tcp_port_secure>2281</tcp_port_secure> so the Keeper process binds
+    chop-generated-listeners.xml (conf.d) emits <tcp_port_secure>2281</tcp_port_secure>
+    while the common overlay chop-generated-common-listeners.xml
+    (keeper_config.d) emits <tcp_port remove="1"/> — the removal must sit in
+    the common dir alongside the static <tcp_port> it deletes, since Keeper
+    merges keeper_config.d after conf.d — so the Keeper process binds
     no plaintext listener at all; and the liveness probe falls back to
     `pgrep` because upstream Keeper does not serve 4LW over TLS. Raft
     inter-peer TLS is still wired (<secure>1</secure> per <server>).
@@ -8185,18 +8223,30 @@ def test_020014(self):
         )
         assert "zk-secure" in cports, error(f"expected zk-secure container port, got {cports}")
 
-    with And("Per-host ConfigMap listeners XML suppresses tcp_port and emits tcp_port_secure"):
+    with And("Per-host ConfigMap (conf.d) listeners XML opens tcp_port_secure, no plaintext removal"):
         cm = kubectl.get("configmap", f"chk-{chk}-deploy-confd-{cluster}-{host}")
         data = cm.get("data", {})
         assert "chop-generated-listeners.xml" in data, error(
             f"chop-generated-listeners.xml missing; ConfigMap keys: {list(data.keys())}"
         )
         xml = data["chop-generated-listeners.xml"]
-        assert '<tcp_port remove="1"/>' in xml, error(
-            f"expected <tcp_port remove=\"1\"/> suppression in listeners xml:\n{xml}"
-        )
         assert "<tcp_port_secure>2281</tcp_port_secure>" in xml, error(
-            f"expected <tcp_port_secure>2281</tcp_port_secure> in listeners xml:\n{xml}"
+            f"expected <tcp_port_secure>2281</tcp_port_secure> in per-host listeners xml:\n{xml}"
+        )
+        assert '<tcp_port remove="1"/>' not in xml, error(
+            f"plaintext removal must NOT be in the per-host conf.d overlay (it cannot win the "
+            f"merge against the static tcp_port in keeper_config.d); got:\n{xml}"
+        )
+
+    with And("Common ConfigMap (keeper_config.d) removes the static plaintext tcp_port"):
+        cm = kubectl.get("configmap", f"chk-{chk}-common-configd")
+        data = cm.get("data", {})
+        assert "chop-generated-common-listeners.xml" in data, error(
+            f"chop-generated-common-listeners.xml missing; ConfigMap keys: {list(data.keys())}"
+        )
+        xml = data["chop-generated-common-listeners.xml"]
+        assert '<tcp_port remove="1"/>' in xml, error(
+            f"expected <tcp_port remove=\"1\"/> suppression in common listeners xml:\n{xml}"
         )
 
     with And("Liveness probe falls back to pgrep (4LW unavailable over TLS)"):
@@ -8211,6 +8261,41 @@ def test_020014(self):
         raft_xml = cm.get("data", {}).get("chop-generated-raft.xml", "")
         assert "<secure>1</secure>" in raft_xml, error(
             f"expected <secure>1</secure> in raft xml under secure=yes:\n{raft_xml}"
+        )
+
+    with And("MERGED keeper config binds NO plaintext 2181 (the regression: removal must win the merge)"):
+        # The source ConfigMap (asserted above) is NOT enough: it carried
+        # <tcp_port remove="1"/> even while the bug was live. The bug lived in
+        # the EFFECTIVE merge — Keeper merges keeper_config.d AFTER conf.d, so a
+        # removal emitted into conf.d lost to the static <tcp_port>2181</tcp_port>
+        # in keeper_config.d and the plaintext port stayed bound. This asserts
+        # the preprocessed (merged) result, the only layer that distinguishes
+        # the buggy operator (plaintext survives) from the fixed one (removed).
+        pod = f"chk-{chk}-{cluster}-{host}-0"
+        # Guard the false-pass: an absent <tcp_port> must mean "removed by the
+        # merge", not "Keeper never started".
+        alive = kubectl.launch(f"exec {pod} -- bash -c 'pgrep -f clickhouse-keeper | wc -l'").strip()
+        assert int(alive) >= 1, error(
+            f"keeper process not alive (pgrep={alive}); an absent plaintext port would be a false pass"
+        )
+        # The preprocessed file is written at config load; gate on the secure
+        # port appearing so we never read a half-written file (false fail).
+        kubectl.wait_command(
+            f"exec {pod} -- bash -c '"
+            'f=/var/lib/clickhouse-keeper/preprocessed_configs/keeper_config.xml; '
+            '[ -s "$f" ] || f=$(find /var/lib/clickhouse-keeper -name keeper_config.xml -path "*preprocessed*" 2>/dev/null | head -1); '
+            'grep -c tcp_port_secure "$f" 2>/dev/null\'',
+            "1",
+        )
+        merged = keeper_merged_config(chk, cluster, f"{host}-0")
+        assert "<tcp_port_secure>2281</tcp_port_secure>" in merged, error(
+            f"merged keeper config missing the secure listener:\n{merged}"
+        )
+        # `<tcp_port>` (closing angle bracket right after the name) does NOT
+        # match `<tcp_port_secure>`, so this is the plaintext-only check.
+        assert "<tcp_port>" not in merged, error(
+            "plaintext <tcp_port> survived the keeper_config.d-after-conf.d merge — "
+            f"the removal lost (emitted into the wrong dir). Merged config:\n{merged}"
         )
 
     with Finally("I clean up"):
@@ -8308,6 +8393,14 @@ def test_020016(self):
         assert "chop-generated-listeners.xml" not in data, error(
             "chop-generated-listeners.xml must be absent when both cluster.secure and "
             f"cluster.insecure are unset; ConfigMap keys: {list(data.keys())}"
+        )
+
+    with And("Common ConfigMap omits chop-generated-common-listeners.xml (byte-identity for non-adopters)"):
+        cm = kubectl.get("configmap", f"chk-{chk}-common-configd")
+        data = cm.get("data", {})
+        assert "chop-generated-common-listeners.xml" not in data, error(
+            "chop-generated-common-listeners.xml (plaintext-port removal) must be absent for a "
+            f"legacy CHK; ConfigMap keys: {list(data.keys())}"
         )
 
     with And("Liveness probe uses bash /dev/tcp ruok (NOT pgrep fallback)"):

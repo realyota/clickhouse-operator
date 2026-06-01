@@ -304,6 +304,24 @@ def get(kind, name, label="", ns=None, ok_to_fail=False, shell=None):
         raise ValueError(f"Failed to parse JSON from: {stripped}") from e
 
 
+def get_container_restart_count(pod, container, ns=None, shell=None):
+    """restartCount of a single named container in a pod; None if pod/container absent.
+
+    Name-scoped on purpose: callers detecting a SPECIFIC container's in-place
+    restart must not use the pod-total sum (which moves whenever any sibling
+    container restarts). Parses the pod JSON in Python to avoid the jsonpath
+    quoting hazard of an inline `[?(@.name=="...")]` filter.
+    """
+    pod_obj = get("pod", pod, ns=ns, ok_to_fail=True, shell=shell)
+    if not pod_obj:
+        return None
+    statuses = (pod_obj.get("status") or {}).get("containerStatuses") or []
+    for cs in statuses:
+        if cs.get("name") == container:
+            return int(cs.get("restartCount") or 0)
+    return None
+
+
 def get_chi_normalizedCompleted(chi, ns=None, shell=None):
     chi_storage = get("configmap", f"chi-storage-{chi}", ns=ns)
     return json.loads(chi_storage["data"]["status-normalizedCompleted"])

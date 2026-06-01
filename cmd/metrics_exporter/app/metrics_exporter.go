@@ -25,7 +25,12 @@ import (
 	log "github.com/golang/glog"
 	// log "k8s.io/klog"
 
+	"k8s.io/client-go/tools/cache"
+
+	api "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
 	"github.com/altinity/clickhouse-operator/pkg/chop"
+	chopclientset "github.com/altinity/clickhouse-operator/pkg/client/clientset/versioned"
+	chopinformers "github.com/altinity/clickhouse-operator/pkg/client/informers/externalversions"
 	"github.com/altinity/clickhouse-operator/pkg/metrics/clickhouse"
 	"github.com/altinity/clickhouse-operator/pkg/util/fips"
 	"github.com/altinity/clickhouse-operator/pkg/version"
@@ -143,5 +148,52 @@ func Run() {
 
 	exporter.DiscoveryWatchedCHIs(kubeClient, chopClient)
 
+	// Watch ClickHouseOperatorConfiguration and restart this container on a
+	// genuine change, mirroring the operator. The operator reacts to chopconf
+	// changes by exiting its process (controller.restartOperatorOnConfigChange),
+	// but that restarts ONLY the operator container — this exporter sibling in
+	// the same Pod would otherwise keep serving its stale startup FIPS/TLS
+	// posture until the whole Pod is recreated. Gated by the same
+	// watch.configuration.onChange=restart switch as the operator.
+	startChopConfigRestartWatcher(ctx, chopClient)
+
 	<-ctx.Done()
+}
+
+// startChopConfigRestartWatcher wires a ClickHouseOperatorConfiguration informer
+// that exits the exporter process on a genuine config change so Kubernetes
+// restarts the container with the new merged config. It mirrors the operator's
+// chopconf handlers (pkg/controller/chi/controller.go addEventHandlersChopConfig
+// + addChopConfig/updateChopConfig) so both containers react identically.
+func startChopConfigRestartWatcher(ctx context.Context, chopClient *chopclientset.Clientset) {
+	factory := chopinformers.NewSharedInformerFactoryWithOptions(
+		chopClient,
+		0, // no resync; the ResourceVersion guard below also covers any resync
+		chopinformers.WithNamespace(chop.Config().Runtime.Namespace),
+	)
+	factory.Clickhouse().V1().ClickHouseOperatorConfigurations().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			cfg, ok := obj.(*api.ClickHouseOperatorConfiguration)
+			// Skip the initial list-sync replay of the config already loaded at
+			// startup (same ns+name+ResourceVersion is in ConfigManager's list),
+			// so the exporter does not exit on boot. Mirrors operator addChopConfig.
+			if !ok || chop.Get().ConfigManager.IsConfigListed(cfg) {
+				return
+			}
+			chop.RestartOnConfigChange("ClickHouseOperatorConfiguration added")
+		},
+		UpdateFunc: func(old, new interface{}) {
+			o, ok1 := old.(*api.ClickHouseOperatorConfiguration)
+			n, ok2 := new.(*api.ClickHouseOperatorConfiguration)
+			// Skip resync no-ops. Mirrors operator updateChopConfig.
+			if !ok1 || !ok2 || o.GetResourceVersion() == n.GetResourceVersion() {
+				return
+			}
+			chop.RestartOnConfigChange("ClickHouseOperatorConfiguration updated")
+		},
+		DeleteFunc: func(obj interface{}) {
+			chop.RestartOnConfigChange("ClickHouseOperatorConfiguration deleted")
+		},
+	})
+	factory.Start(ctx.Done())
 }

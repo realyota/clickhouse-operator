@@ -14,12 +14,13 @@ import e2e.kubectl as kubectl
 import e2e.util as util
 
 from requirements.requirements import *
+from requirements.fips import *
 from testflows.connect import Shell
 from testflows.asserts import error
 from testflows.core import *
 from e2e.steps import *
 from datetime import datetime
-
+from e2e.steps_fips import *
 
 @TestScenario
 @Name("test_010001. 1 node")
@@ -656,7 +657,7 @@ def test_operator_upgrade(self, manifest, service, version_from, version_to=None
 @Name("test_010009_1. Test operator upgrade")
 @Requirements(RQ_SRS_026_ClickHouseOperator_Managing_UpgradingOperator("1.0"))
 @Tags("NO_PARALLEL")
-def test_010009_1(self, version_from="0.27.0", version_to=None):
+def test_010009_1(self, version_from="0.26.3", version_to=None):
     if version_to is None:
         version_to = self.context.operator_version
 
@@ -672,7 +673,7 @@ def test_010009_1(self, version_from="0.27.0", version_to=None):
 @TestScenario
 @Name("test_010009_2. Test operator upgrade")
 @Tags("NO_PARALLEL")
-def test_010009_2(self, version_from="0.27.0", version_to=None):
+def test_010009_2(self, version_from="0.26.3", version_to=None):
     if version_to is None:
         version_to = self.context.operator_version
 
@@ -6980,462 +6981,9 @@ def test_010072(self):
     with Finally("I clean up"):
         delete_test_namespace()
 
-
-@TestScenario
-@Name("test_010073. FIPS Strict: plain-text ZooKeeper CHI is rejected with FIPSValidationFailed reason")
-@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
-def test_010073(self):
-    """Activate Strict FIPS mode at the operator level, then apply a CHI that
-    references plain-text external ZooKeeper (`secure: true` not set on any
-    node). The operator must:
-
-      1. Coerce per-component security knobs (logged at startup).
-      2. Reject the CHI at normalize time with status=Aborted.
-      3. Tag the error stream with `[FIPSValidationFailed]` so operators and
-         dashboards can distinguish the FIPS rejection from generic Aborted.
-
-    Recovery is via spec edit (informer UpdateFunc on next `kubectl apply`),
-    not via the auto-recovery onPodReady path — pods are never created for
-    the rejected CHI.
-    """
-    create_shell_namespace_clickhouse_template()
-
-    chopconf_file = "manifests/chopconf/test-073-fips-strict-chopconf.yaml"
-    chi_manifest = "manifests/chi/test-073-fips-zk-rejected.yaml"
-    operator_namespace = current().context.operator_namespace
-    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
-
-    with Given("Apply Strict FIPS chopconf and restart operator"):
-        util.apply_operator_config(chopconf_file)
-
-    with And("Operator log shows FIPS coercion entries"):
-        operator_pod = kubectl.get_operator_pod()
-        op_logs = kubectl.launch(
-            f"logs {operator_pod} -c clickhouse-operator --tail=400 --all-containers=false",
-            ns=operator_namespace,
-            ok_to_fail=True,
-        )
-        # At least one knob should have been coerced (default config has none of
-        # the strict positions set). At -v=0 the line is suppressed; gate this
-        # assertion behind a substring search that tolerates either presence.
-        # Soft check: we only assert reconciler behavior below.
-        _ = op_logs
-
-    with When("Apply CHI referencing plain-text external ZooKeeper (missing `secure`)"):
-        kubectl.apply(util.get_full_path(chi_manifest))
-
-    with Then("CHI lands in status=Aborted"):
-        kubectl.wait_chi_status(chi, 'Aborted')
-
-    with And("Aborted reason is [FIPSValidationFailed]"):
-        errors = kubectl.get_field('chi', chi, '.status.errors')
-        print(errors)
-        assert "FIPSValidationFailed" in errors, error(
-                f"expected [FIPSValidationFailed] reason in status.errors, got {errors}"
-        )
-
-    # Sibling sub-assertion: the FIPS validator must reject not only the
-    # implicit `secure: <missing>` case (covered above) but also the
-    # *explicit* `secure: false` case. A naive validator that walks the spec
-    # tree with `if zkNode.Secure != nil && *zkNode.Secure == false: reject`
-    # has different code paths from the missing-field case and the two paths
-    # can drift; we exercise both. The explicit-false manifest is a sibling
-    # of the missing-secure manifest, differing only in that field.
-    chi_explicit_manifest = "manifests/chi/test-073-fips-zk-rejected-explicit-false.yaml"
-    chi_explicit = yaml_manifest.get_name(util.get_full_path(chi_explicit_manifest))
-    with When("Apply CHI with explicit `secure: false` on ZooKeeper nodes"):
-        kubectl.apply(util.get_full_path(chi_explicit_manifest))
-
-    with Then("Explicit-false CHI also lands in status=Aborted"):
-        kubectl.wait_chi_status(chi_explicit, 'Aborted')
-
-    with And("Aborted reason on explicit-false CHI is also [FIPSValidationFailed]"):
-        errors = kubectl.get_field('chi', chi_explicit, '.status.errors')
-        print(errors)
-        assert "FIPSValidationFailed" in errors, error(
-            f"expected [FIPSValidationFailed] reason in status.errors for "
-            f"explicit `secure: false` CHI, got {errors}"
-        )
-
-    with Finally("I clean up"):
-        delete_test_namespace()
-
-
-@TestScenario
-@Name("test_010074. FIPS image policy Required: non-fips CHI is rejected at admission with FIPSImagePolicyViolation reason")
-@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
-def test_010074(self):
-    """Activate security.images.policy=Required at the operator level
-    and apply a CHI whose resolved ClickHouse image lacks the "fips" tag
-    substring. The operator's admission gate must:
-
-      1. Refuse the CHI at normalize time (before any pod is created).
-      2. Set status=Aborted with `[FIPSImagePolicyViolation]` leading the
-         error stream — auto-recovery skip relies on the prefix.
-
-    Image policy is orthogonal to security.policy (master TLS switch); this
-    test isolates the image-policy branch by leaving security.policy unset.
-    Recovery is via spec edit (informer UpdateFunc on next `kubectl apply`),
-    not via the auto-recovery onPodReady path — pods never exist.
-    """
-    create_shell_namespace_clickhouse_template()
-
-    chopconf_file = "manifests/chopconf/test-074-fips-images-required-chopconf.yaml"
-    chi_manifest = "manifests/chi/test-074-fips-images-required-non-fips.yaml"
-    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
-
-    with Given("Apply FIPS image-policy=Required chopconf and restart operator"):
-        util.apply_operator_config(chopconf_file)
-
-    with When("Apply CHI whose default image lacks the 'fips' tag substring"):
-        kubectl.apply(util.get_full_path(chi_manifest))
-
-    with Then("CHI lands in status=Aborted"):
-        kubectl.wait_chi_status(chi, 'Aborted')
-
-    with And("Aborted reason is [FIPSImagePolicyViolation]"):
-        errors = kubectl.get_field('chi', chi, '.status.errors')
-        assert "FIPSImagePolicyViolation" in errors, error(
-            f"expected [FIPSImagePolicyViolation] reason in status.errors, got {errors}"
-        )
-
-    with And("First error entry starts with the [FIPSImagePolicyViolation] prefix (contract)"):
-        # pkg/controller/chi/worker-pod-retry.go:36-39 distinguishes
-        # auto-recovery-eligible failures from terminal FIPS rejections by
-        # matching the LEADING `[FIPSImagePolicyViolation]` prefix on
-        # errors[0]. If a future refactor relocates the tag mid-string the
-        # auto-recovery skip stops working and pods spin-retry forever.
-        # `get_field` collapses list output into a whitespace-separated
-        # rendering; assert that the prefix sits at the head of the string.
-        stripped = errors.strip().lstrip("[").lstrip()
-        assert errors.strip().startswith("[FIPSImagePolicyViolation]") or \
-            stripped.startswith("FIPSImagePolicyViolation]"), error(
-            f"errors[0] must START with [FIPSImagePolicyViolation] prefix "
-            f"(auto-recovery contract in worker-pod-retry.go:36-39 depends on "
-            f"the leading bracket-tag); got: {errors!r}"
-        )
-
-    with And("No StatefulSet was created for the rejected CHI"):
-        sts = kubectl.get_count('sts', label = f'clickhouse.altinity.com/chi={chi}')
-        assert sts == 0, error(f"expected no STS for aborted CHI, got {sts}")
-
-    with Finally("I clean up"):
-        delete_test_namespace()
-
-
-@TestScenario
-@Name("test_010075. FIPS image policy Required: CHI with fips-tagged image reconciles normally")
-@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
-def test_010075(self):
-    """Positive-path counterpart to test_010074. With image-policy=Required
-    in chopconf, a CHI whose PodTemplate container "clickhouse" carries an
-    image whose tag contains the "fips" substring must reconcile to
-    Completed — the gate's substring match is case-insensitive and matches
-    the Altinity ".altinityfips" convention.
-
-    The container name MUST be exactly "clickhouse" — templates using
-    "clickhouse-pod" or other names fall through to the operator default
-    image and would be rejected; that is a known mismatch worth documenting
-    via this test rather than masking it.
-    """
-    create_shell_namespace_clickhouse_template()
-
-    chopconf_file = "manifests/chopconf/test-074-fips-images-required-chopconf.yaml"
-    chi_manifest = "manifests/chi/test-075-fips-images-required-fips.yaml"
-    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
-
-    with Given("Apply FIPS image-policy=Required chopconf and restart operator"):
-        util.apply_operator_config(chopconf_file)
-
-    with When("Apply CHI with fips-tagged ClickHouse image"):
-        kubectl.create_and_check(
-            manifest=chi_manifest,
-            check={
-                "pod_count": 1,
-                "do_not_delete": 1,
-            },
-        )
-
-        with Then("No FIPSImagePolicyViolation error appears"):
-            errors = kubectl.get_field('chi', chi, '.status.errors')
-            assert "FIPSImagePolicyViolation" not in errors, error(
-                f"unexpected FIPSImagePolicyViolation in status.errors, got {errors}"
-            )
-
-    with Finally("I clean up"):
-        delete_test_namespace()
-
-
-@TestScenario
-@Name("test_010076. FIPS posture: default operator image is FIPS-built")
-@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
-def test_010076(self):
-    """Pin the operator-wide FIPS posture as a release-gate invariant.
-
-    The operator emits a single banner at startup of the form
-        FIPS: chopconf.fips.enforced=<bool> build.enabled=<bool> runtime.enforced=<bool> module=<ver>
-
-    Regardless of `security.fips.enforced` in chopconf (FIPS cryptographic-
-    module gate — opt-in), the shipped default image MUST be GOFIPS140-built
-    so the Go FIPS crypto module is linked (`build.enabled=true`). A regression
-    that drops GOFIPS140 silently downgrades FIPS strength across the whole
-    fleet, so we fail the e2e run rather than let it slip through.
-
-    Runtime mode is `GODEBUG=fips140=off` in the default image (FIPS module
-    linked into the binary but not active at runtime). `runtime.enforced`
-    therefore reads `false` for the shipped default — the test asserts that
-    explicitly. Customers opt the module into active mode via Pod env
-    (`GODEBUG=fips140=on` for permissive, `=only` for strict-panic) without
-    needing to rebuild. The `pkg/util/{hash,shell}.go` deterministic-identifier
-    hashing uses inline pure-Go SHA-1/MD5 implementations that do NOT invoke
-    `crypto/sha1`/`crypto/md5`, so they remain safe even under the strictest
-    `fips140=only` override. See
-    `docs/security_hardening_fips.md` § "Non-security hash exclusions" for the
-    FIPS-boundary rationale. The `GODEBUG_FIPS140` Docker build-arg
-    parameterizes the baked default (accepted: `off`|`on`|`only`|`debug`);
-    customers can override at runtime via Pod env, Helm `operator.env`, or
-    `kubectl set env`.
-
-    Build linkage is driven by `dev/go_build_config.sh` defaulting GOFIPS140
-    to v1.0.0 and propagated by every image-build entrypoint (CI, dev-image,
-    Vagrant, devspace).
-    """
-    create_shell_namespace_clickhouse_template()
-    operator_namespace = current().context.operator_namespace
-
-    with Given("Operator pod is running the default install"):
-        operator_pod = kubectl.get_operator_pod(ns=operator_namespace)
-        assert operator_pod != "", error("operator pod not found")
-
-    # Release-gate invariant covers BOTH binaries shipped from the operator
-    # pod: clickhouse-operator AND metrics-exporter. The two are built from
-    # the same Go module under the same GOFIPS140 build flag, but they are
-    # distinct images with separate image-build entrypoints — a regression
-    # that drops the build tag from one image will not necessarily drop it
-    # from the other. Assert the banner symmetrically against both
-    # containers so future regressions in either binary fail this gate.
-    # Banner format (post-iter-2 gate-semantic fix) has FOUR booleans:
-    #   chopconf.fips.enforced — chopconf knob
-    #   build.linked           — BuildSetting("GOFIPS140") != "" (durable
-    #                            build-time linkage; survives GODEBUG modes)
-    #   module.active          — fips140.Enabled() (module currently active
-    #                            as crypto provider; reflects GODEBUG state)
-    #   runtime.enforced       — fips140.Enforced() (strict-only mode active)
-    banner_pattern = (
-        r"FIPS: chopconf\.fips\.enforced=(true|false) "
-        r"build\.linked=(true|false) "
-        r"module\.active=(true|false) "
-        r"runtime\.enforced=(true|false) "
-        r"module=\S+"
-    )
-
-    # Use --tail=-1 (no cap): the FIPS banner lands at ~line 500-700 of the
-    # operator log because chop.Config().String(true) dumps ~500-700 lines of
-    # yaml before the banner is emitted. A bounded --tail value (e.g. 400)
-    # silently misses the banner on a freshly-restarted operator and the
-    # regex match falsely fails — the binary is FIPS-built but we never see
-    # the line we need to verify. -1 disables the kubectl-side cap.
-    # The real release-gate invariant is: was the binary linked with the
-    # GOFIPS140 build tag? Post-Go-1.24 the banner's `build.enabled` field
-    # tracks `crypto/fips140.Enabled()`, which only returns true under
-    # `GODEBUG=fips140=on|only` at runtime — it conflates build linkage with
-    # runtime mode. Since the shipped default image bakes `fips140=off`,
-    # `build.enabled` now reads `false` even on a properly FIPS-built binary.
-    # The unambiguous "GOFIPS140 build-arg present" signal is the `FIPS env:`
-    # line's `GOFIPS140=` field (printed from `runtime/debug.BuildInfo`), which
-    # is non-empty iff the binary was built with `-tags goexperiment.boringcrypto`
-    # /`GOFIPS140=v1.0.0`. Capture it as group(1) and assert non-empty.
-    fips_env_pattern = (
-        r'FIPS env: GODEBUG="[^"]*" DefaultGODEBUG="[^"]*" GOFIPS140="([^"]*)"'
-    )
-
-    with When("Read the operator startup banner"):
-        op_logs = kubectl.launch(
-            f"logs {operator_pod} -c clickhouse-operator --tail=-1",
-            ns=operator_namespace,
-        )
-
-    with Then("Banner is present (banner-format regression catch)"):
-        m = re.search(banner_pattern, op_logs)
-        assert m is not None, error(
-            "FIPS startup banner not found in operator logs (tail=-1) — "
-            "operator may be from a pre-FIPS-gate image"
-        )
-
-    with And("FIPS env line reports non-empty GOFIPS140 (GOFIPS140 build-arg present)"):
-        env_m = re.search(fips_env_pattern, op_logs)
-        assert env_m is not None, error(
-            "FIPS env line not found in operator logs — banner enhancement "
-            "missing OR image predates the GOFIPS140 release gate"
-        )
-        gofips140 = env_m.group(1)
-        assert gofips140 != "", error(
-            f"operator image is NOT FIPS-built: GOFIPS140={gofips140!r} "
-            f"(expected non-empty, e.g. 'v1.0.0' — GOFIPS140 build-arg dropped)"
-        )
-
-    with When("Read the metrics-exporter startup banner"):
-        exporter_logs = kubectl.launch(
-            f"logs {operator_pod} -c metrics-exporter --tail=-1",
-            ns=operator_namespace,
-        )
-
-    with Then("Banner is present in metrics-exporter logs (banner-format regression catch)"):
-        m = re.search(banner_pattern, exporter_logs)
-        assert m is not None, error(
-            "FIPS startup banner not found in metrics-exporter logs (tail=-1) — "
-            "exporter image may be from a pre-FIPS-gate build"
-        )
-
-    with And("FIPS env line reports non-empty GOFIPS140 for metrics-exporter"):
-        env_m = re.search(fips_env_pattern, exporter_logs)
-        assert env_m is not None, error(
-            "FIPS env line not found in metrics-exporter logs — banner "
-            "enhancement missing OR exporter image predates the FIPS gate"
-        )
-        gofips140 = env_m.group(1)
-        assert gofips140 != "", error(
-            f"metrics-exporter image is NOT FIPS-built: GOFIPS140={gofips140!r} "
-            f"(expected non-empty, e.g. 'v1.0.0' — GOFIPS140 build-arg dropped from exporter)"
-        )
-
-    with Finally("I clean up"):
-        delete_test_namespace()
-
-
-@TestScenario
-@Name("test_010077. FIPS on-wire TLS verification: Strict + wrong rootCA fails ClickHouse fetch")
-@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
-def test_010077(self):
-    """Exercise the FIPS-built TLS stack on the wire and prove it actually
-    verifies peer certs rather than silently falling back to
-    InsecureSkipVerify=true.
-
-    The release gate for FIPS asks for "e2e test using the FIPS operator
-    image with verified TLS". Banner-only tests (test_010076) confirm the
-    binary is built against the Go FIPS module, but they cannot detect a
-    silent code-path regression that bypasses the verifying TLS dialer.
-    This test closes that gap with a NEGATIVE roundtrip:
-
-      1. Deploy a ClickHouse with a self-signed cert (reusing the test-058
-         server cert + key + CA secret).
-      2. Configure the operator with `security.clickhouse.tls.verify=Strict`
-         and an inline `rootCA` that is NOT the issuer of the server cert
-         (self-signed CA CN=test-077-unrelated-ca.example, generated
-         specifically for this test — guarantees chain validation fails).
-      3. Assert `chi_clickhouse_metric_fetch_errors == 1`: the operator's
-         outbound TLS handshake must fail cert verification and the metric
-         exporter must surface it.
-
-    A positive roundtrip would require provisioning a server cert signed by
-    a CA whose PEM is reproducible across runs; the negative roundtrip
-    exercises the same `crypto/tls` code path under FIPS without that
-    infrastructure burden, while still failing loudly if a future change
-    re-introduces InsecureSkipVerify=true on the strict path.
-    """
-    create_shell_namespace_clickhouse_template()
-    operator_namespace = current().context.operator_namespace
-
-    with Given("test-058-root-ca secret is installed (reused for server cert/key/CA)"):
-        kubectl.apply(
-            util.get_full_path("manifests/secret/test-058-secret.yaml"),
-        )
-
-    chi_manifest = "manifests/chi/test-077-fips-tls-wrong-ca.yaml"
-    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
-
-    with When("Create the CHI with HTTPS-enabled ClickHouse"):
-        kubectl.create_and_check(
-            manifest=chi_manifest,
-            check={
-                "apply_templates": {
-                    current().context.clickhouse_template,
-                },
-                "object_counts": {"statefulset": 1, "pod": 1, "service": 2},
-                "do_not_delete": 1,
-            },
-        )
-
-    chopconf_file = "manifests/chopconf/test-077-fips-tls-wrong-ca-chopconf.yaml"
-    with When("Apply chopconf with verify=Strict and a deliberately wrong rootCA"):
-        util.apply_operator_config(chopconf_file)
-        kubectl.wait_chi_status(chi, "Completed")
-
-    with Then("chi_clickhouse_metric_fetch_errors is 1 — TLS handshake rejected"):
-        # Negative assertion: the strict-verify path must refuse the server
-        # cert (issuer != configured rootCA). If this metric reports 0, the
-        # operator silently downgraded to InsecureSkipVerify=true — exactly
-        # the regression this test guards against. Pin the chi label so a
-        # stray fetch_errors=1 on an unrelated CHI cannot satisfy the assertion.
-        check_metrics_monitoring(
-            operator_namespace=operator_namespace,
-            operator_pod=kubectl.get_operator_pod(),
-            expect_pattern=f'^chi_clickhouse_metric_fetch_errors{{[^}}]*chi="{chi}"[^}}]*}} 1$',
-        )
-
-    with When("Reset ClickHouseOperatorConfiguration to default"):
-        kubectl.delete(util.get_full_path(chopconf_file, lookup_in_host=False), operator_namespace)
-        util.restart_operator()
-
-    with Finally("I clean up"):
-        delete_test_namespace()
-
-
-@TestScenario
-@Name("test_010078. FIPS Enforced: cluster-level verify=None on CHI is rejected with FIPSValidationFailed reason")
-@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
-def test_010078(self):
-    """CHI counterpart of test_020009 (CHK) and a per-cluster sibling of
-    test_010073 (CHI/ZK). With `security.policy: Enforced` at the operator
-    level, a CHI whose .spec.configuration.clusters[].security.clickhouse.tls.verify
-    is explicitly set to None must be rejected at normalize time.
-
-    Where test_010073 covers the implicit-bypass route (plain-text ZK without
-    `secure: true`), this test covers the per-cluster explicit-bypass route:
-    the user opted into a Strict FIPS posture at the operator level and then
-    tried to escape it inside a single cluster. The validator must:
-
-      1. Set status=Aborted with [FIPSValidationFailed] in errors[0].
-      2. Refuse to create any StatefulSet for the rejected CHI (no half-
-         provisioned resources lying around requiring manual cleanup).
-    """
-    create_shell_namespace_clickhouse_template()
-
-    chopconf_file = "manifests/chopconf/test-078-fips-verify-none-chopconf.yaml"
-    chi_manifest = "manifests/chi/test-078-fips-verify-none.yaml"
-    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
-
-    with Given("Apply Enforced-policy FIPS chopconf and restart operator"):
-        util.apply_operator_config(chopconf_file)
-
-    with When("Apply CHI with cluster.security.clickhouse.tls.verify=None"):
-        kubectl.apply(util.get_full_path(chi_manifest))
-
-    with Then("CHI lands in status=Aborted"):
-        kubectl.wait_chi_status(chi, 'Aborted')
-
-    with And("Aborted reason is [FIPSValidationFailed]"):
-        errors = kubectl.get_field('chi', chi, '.status.errors')
-        print(errors)
-        assert "FIPSValidationFailed" in errors, error(
-            f"expected [FIPSValidationFailed] reason in status.errors, got {errors}"
-        )
-
-    with And("No StatefulSet was created for the rejected CHI"):
-        # The rejection must happen before any resource provisioning so
-        # there is nothing to clean up downstream. Matches the contract
-        # already enforced by test_010074 for the image-policy branch.
-        sts = kubectl.get_count('sts', label=f'clickhouse.altinity.com/chi={chi}')
-        assert sts == 0, error(f"expected no STS for aborted CHI, got {sts}")
-
-    with Finally("I clean up"):
-        delete_test_namespace()
-
-
 #
 # Keeper tests section
 #
-
 
 @TestScenario
 @Name("test_020000. Test Basic CHK functions")
@@ -7863,144 +7411,6 @@ def test_020007(self):
     with Finally("I clean up"):
         delete_test_namespace()
 
-@TestScenario
-@Name("test_020008. Test FIPS versions are properly supported by both in CHI and CHK")
-def test_020008(self):
-    create_shell_namespace_clickhouse_template()
-
-    chk_manifest = f"manifests/chk/test-020008-chk-fips.yaml"
-    chi_manifest = f"manifests/chk/test-020008-chi-fips.yaml"
-    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
-    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
-
-    cluster = "default"
-
-    with Given("CHK with FIPS versions"):
-        kubectl.create_and_check(
-            manifest=chk_manifest,
-            kind = "chk",
-            check={
-                "pod_count": 1,
-                "do_not_delete": 1,
-            },
-        )
-
-
-    with And("CHI with FIPS version"):
-        kubectl.create_and_check(
-            manifest=chi_manifest,
-            check={
-                "pod_count": 2,
-                "do_not_delete": 1,
-            },
-        )
-
-    with Then("Clickhouse version is a FIPS one"):
-        ver = clickhouse.query(chi, 'select version()')
-        print(ver)
-        assert "fips" in ver
-
-    check_replication(chi, {0, 1}, 1)
-
-    with Finally("I clean up"):
-        delete_test_namespace()
-
-
-@TestScenario
-@Name("test_020009. FIPS Strict: CHK with spec-level security bypass is rejected with FIPSValidationFailed reason")
-@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
-def test_020009(self):
-    """Symmetric to test_010073 but for CHK. Activate Strict FIPS at the
-    operator level, then apply a CHK whose spec-level security explicitly
-    sets tls.verify=None. The spec value is inherited into every cluster via
-    InheritClusterSecurityFrom, then the normalizer's rejectFIPSBypass must
-    reject the CHK with status=Aborted and [FIPSValidationFailed] in the
-    error stream.
-    """
-    create_shell_namespace_clickhouse_template()
-
-    chopconf_file = "manifests/chopconf/test-073-fips-strict-chopconf.yaml"
-    chk_manifest = "manifests/chk/test-020009-chk-fips-bypass-rejected.yaml"
-    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
-
-    with Given("Apply Strict FIPS chopconf and restart operator"):
-        util.apply_operator_config(chopconf_file)
-
-    with When("Apply CHK with spec-level security bypass"):
-        kubectl.apply(util.get_full_path(chk_manifest))
-
-    with Then("CHK lands in status=Aborted"):
-        kubectl.wait_chk_status(chk, 'Aborted')
-
-    with And("Aborted reason is [FIPSValidationFailed]"):
-        errors = kubectl.get_field('chk', chk, '.status.errors')
-        print(errors)
-        assert "FIPSValidationFailed" in errors, error(
-                f"expected [FIPSValidationFailed] reason in status.errors, got {errors}"
-        )
-
-    with Finally("I clean up"):
-        delete_test_namespace()
-
-
-@TestScenario
-@Name("test_020010. FIPS image policy Required: non-fips CHK is rejected at admission with FIPSImagePolicyViolation reason")
-@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
-def test_020010(self):
-    """CHK mirror of test_010074. With image-policy=Required, a CHK whose
-    resolved Keeper image lacks the "fips" tag substring must be rejected
-    at admission. Asserts the CHK normalizer wires the same gate as the
-    CHI side (the implementations are mirrors of each other).
-
-    Status reason `FIPSImagePolicyViolation` is re-exported from the CHI
-    constant in pkg/apis/clickhouse-keeper.altinity.com/v1/type_status.go,
-    so dashboards keyed on the CHI reason continue working for CHK aborts.
-    """
-    create_shell_namespace_clickhouse_template()
-
-    chopconf_file = "manifests/chopconf/test-074-fips-images-required-chopconf.yaml"
-    chk_manifest = "manifests/chk/test-020010-chk-fips-images-required-non-fips.yaml"
-    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
-
-    with Given("Apply FIPS image-policy=Required chopconf and restart operator"):
-        util.apply_operator_config(chopconf_file)
-
-    with When("Apply CHK whose default Keeper image lacks the 'fips' tag substring"):
-        kubectl.apply(util.get_full_path(chk_manifest))
-
-    with Then("CHK lands in status=Aborted"):
-        kubectl.wait_chk_status(chk, 'Aborted')
-
-    with And("Aborted reason is [FIPSImagePolicyViolation]"):
-        errors = kubectl.get_field('chk', chk, '.status.errors')
-        assert "FIPSImagePolicyViolation" in errors, error(
-            f"expected [FIPSImagePolicyViolation] reason in status.errors, got {errors}"
-        )
-
-    with Finally("I clean up"):
-        delete_test_namespace()
-
-
-def keeper_merged_config(chk, cluster="keeper", replica="0-0-0"):
-    """Return the EFFECTIVE merged keeper_config.xml from the running Keeper pod.
-
-    Keeper writes the post-merge result (keeper_config.d merged AFTER conf.d)
-    to <data_dir>/preprocessed_configs/. This is the ONLY layer where the
-    plaintext-port removal can be observed actually winning: the source
-    ConfigMap carries <tcp_port remove="1"/> even when the merge ignores it, so
-    asserting on the source XML cannot catch the merge-order regression.
-    Path-robust against version drift via a find fallback over the data dir;
-    a missing file makes cat fail loudly (kubectl.launch asserts), never a
-    silent empty-string false pass.
-    """
-    pod = f"chk-{chk}-{cluster}-{replica}"
-    return kubectl.launch(
-        f"exec {pod} -- bash -c '"
-        'f=/var/lib/clickhouse-keeper/preprocessed_configs/keeper_config.xml; '
-        '[ -s "$f" ] || f=$(find /var/lib/clickhouse-keeper -name keeper_config.xml -path "*preprocessed*" 2>/dev/null | head -1); '
-        'cat "$f"\''
-    )
-
 
 @TestScenario
 @Name("test_020011. CHK cluster.secure=yes wires zk-secure Service port and Raft <secure>1</secure>")
@@ -8053,59 +7463,6 @@ def test_020011(self):
         raft_xml = data["chop-generated-raft.xml"]
         assert "<secure>1</secure>" in raft_xml, error(
             f"expected <secure>1</secure> in raft xml, got:\n{raft_xml}"
-        )
-
-    with And("MERGED keeper config STILL binds plaintext 2181 (removal is conditional, not over-applied)"):
-        # secure=yes but insecure left exposed (default) -> the plaintext port
-        # must be PRESERVED. This is the positive counterpart to test_020014's
-        # negative: it proves getPlaintextListenerRemoval fires only when every
-        # host is non-insecure, never stripping 2181 from a still-insecure CR.
-        pod = f"chk-{chk}-keeper-0-0-0"
-        alive = kubectl.launch(f"exec {pod} -- bash -c 'pgrep -f clickhouse-keeper | wc -l'").strip()
-        assert int(alive) >= 1, error(f"keeper process not alive (pgrep={alive})")
-        merged = keeper_merged_config(chk)
-        assert "<tcp_port>2181</tcp_port>" in merged, error(
-            "plaintext <tcp_port>2181</tcp_port> must be preserved when insecure is still "
-            f"exposed (removal must not over-apply). Merged config:\n{merged}"
-        )
-
-    with Finally("I clean up"):
-        delete_test_namespace()
-
-
-@TestScenario
-@Name("test_020012. FIPS Strict: CHK without cluster.secure is rejected with FIPSValidationFailed reason")
-@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
-def test_020012(self):
-    """CHK counterpart of test_020009 covering the implicit-bypass branch.
-    Under operator-level FIPS Strict (security.policy=Enforced), a CHK that
-    omits cluster.secure=yes triggers the normalizer's
-    rejectFIPSInsecureKeeperCluster gate. CHK lands in status=Aborted with
-    [FIPSValidationFailed]. Where test_020009 exercises the explicit-bypass
-    branch (security.clickhouse.tls.verify=None propagated via
-    InheritClusterSecurityFrom), this test exercises the implicit-bypass
-    branch (Secure nil → !IsTrue() catches both nil and explicit-false).
-    """
-    create_shell_namespace_clickhouse_template()
-
-    chopconf_file = "manifests/chopconf/test-073-fips-strict-chopconf.yaml"
-    chk_manifest = "manifests/chk/test-020012-chk-fips-secure-required-bypass.yaml"
-    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
-
-    with Given("Apply Strict FIPS chopconf and restart operator"):
-        util.apply_operator_config(chopconf_file)
-
-    with When("Apply CHK without cluster.secure"):
-        kubectl.apply(util.get_full_path(chk_manifest))
-
-    with Then("CHK lands in status=Aborted"):
-        kubectl.wait_chk_status(chk, 'Aborted')
-
-    with And("Aborted reason is [FIPSValidationFailed]"):
-        errors = kubectl.get_field('chk', chk, '.status.errors')
-        print(errors)
-        assert "FIPSValidationFailed" in errors, error(
-            f"expected [FIPSValidationFailed] reason in status.errors, got {errors}"
         )
 
     with Finally("I clean up"):
@@ -8173,11 +7530,8 @@ def test_020014(self):
     suppress every plaintext client surface while preserving the secure
     ones: the per-cluster Service drops zk:2181 entirely; STS container
     ports drop the plaintext zk entry; the per-host overlay
-    chop-generated-listeners.xml (conf.d) emits <tcp_port_secure>2281</tcp_port_secure>
-    while the common overlay chop-generated-common-listeners.xml
-    (keeper_config.d) emits <tcp_port remove="1"/> — the removal must sit in
-    the common dir alongside the static <tcp_port> it deletes, since Keeper
-    merges keeper_config.d after conf.d — so the Keeper process binds
+    chop-generated-listeners.xml emits <tcp_port remove="1"/> alongside
+    <tcp_port_secure>2281</tcp_port_secure> so the Keeper process binds
     no plaintext listener at all; and the liveness probe falls back to
     `pgrep` because upstream Keeper does not serve 4LW over TLS. Raft
     inter-peer TLS is still wired (<secure>1</secure> per <server>).
@@ -8223,30 +7577,18 @@ def test_020014(self):
         )
         assert "zk-secure" in cports, error(f"expected zk-secure container port, got {cports}")
 
-    with And("Per-host ConfigMap (conf.d) listeners XML opens tcp_port_secure, no plaintext removal"):
+    with And("Per-host ConfigMap listeners XML suppresses tcp_port and emits tcp_port_secure"):
         cm = kubectl.get("configmap", f"chk-{chk}-deploy-confd-{cluster}-{host}")
         data = cm.get("data", {})
         assert "chop-generated-listeners.xml" in data, error(
             f"chop-generated-listeners.xml missing; ConfigMap keys: {list(data.keys())}"
         )
         xml = data["chop-generated-listeners.xml"]
-        assert "<tcp_port_secure>2281</tcp_port_secure>" in xml, error(
-            f"expected <tcp_port_secure>2281</tcp_port_secure> in per-host listeners xml:\n{xml}"
-        )
-        assert '<tcp_port remove="1"/>' not in xml, error(
-            f"plaintext removal must NOT be in the per-host conf.d overlay (it cannot win the "
-            f"merge against the static tcp_port in keeper_config.d); got:\n{xml}"
-        )
-
-    with And("Common ConfigMap (keeper_config.d) removes the static plaintext tcp_port"):
-        cm = kubectl.get("configmap", f"chk-{chk}-common-configd")
-        data = cm.get("data", {})
-        assert "chop-generated-common-listeners.xml" in data, error(
-            f"chop-generated-common-listeners.xml missing; ConfigMap keys: {list(data.keys())}"
-        )
-        xml = data["chop-generated-common-listeners.xml"]
         assert '<tcp_port remove="1"/>' in xml, error(
-            f"expected <tcp_port remove=\"1\"/> suppression in common listeners xml:\n{xml}"
+            f"expected <tcp_port remove=\"1\"/> suppression in listeners xml:\n{xml}"
+        )
+        assert "<tcp_port_secure>2281</tcp_port_secure>" in xml, error(
+            f"expected <tcp_port_secure>2281</tcp_port_secure> in listeners xml:\n{xml}"
         )
 
     with And("Liveness probe falls back to pgrep (4LW unavailable over TLS)"):
@@ -8261,41 +7603,6 @@ def test_020014(self):
         raft_xml = cm.get("data", {}).get("chop-generated-raft.xml", "")
         assert "<secure>1</secure>" in raft_xml, error(
             f"expected <secure>1</secure> in raft xml under secure=yes:\n{raft_xml}"
-        )
-
-    with And("MERGED keeper config binds NO plaintext 2181 (the regression: removal must win the merge)"):
-        # The source ConfigMap (asserted above) is NOT enough: it carried
-        # <tcp_port remove="1"/> even while the bug was live. The bug lived in
-        # the EFFECTIVE merge — Keeper merges keeper_config.d AFTER conf.d, so a
-        # removal emitted into conf.d lost to the static <tcp_port>2181</tcp_port>
-        # in keeper_config.d and the plaintext port stayed bound. This asserts
-        # the preprocessed (merged) result, the only layer that distinguishes
-        # the buggy operator (plaintext survives) from the fixed one (removed).
-        pod = f"chk-{chk}-{cluster}-{host}-0"
-        # Guard the false-pass: an absent <tcp_port> must mean "removed by the
-        # merge", not "Keeper never started".
-        alive = kubectl.launch(f"exec {pod} -- bash -c 'pgrep -f clickhouse-keeper | wc -l'").strip()
-        assert int(alive) >= 1, error(
-            f"keeper process not alive (pgrep={alive}); an absent plaintext port would be a false pass"
-        )
-        # The preprocessed file is written at config load; gate on the secure
-        # port appearing so we never read a half-written file (false fail).
-        kubectl.wait_command(
-            f"exec {pod} -- bash -c '"
-            'f=/var/lib/clickhouse-keeper/preprocessed_configs/keeper_config.xml; '
-            '[ -s "$f" ] || f=$(find /var/lib/clickhouse-keeper -name keeper_config.xml -path "*preprocessed*" 2>/dev/null | head -1); '
-            'grep -c tcp_port_secure "$f" 2>/dev/null\'',
-            "1",
-        )
-        merged = keeper_merged_config(chk, cluster, f"{host}-0")
-        assert "<tcp_port_secure>2281</tcp_port_secure>" in merged, error(
-            f"merged keeper config missing the secure listener:\n{merged}"
-        )
-        # `<tcp_port>` (closing angle bracket right after the name) does NOT
-        # match `<tcp_port_secure>`, so this is the plaintext-only check.
-        assert "<tcp_port>" not in merged, error(
-            "plaintext <tcp_port> survived the keeper_config.d-after-conf.d merge — "
-            f"the removal lost (emitted into the wrong dir). Merged config:\n{merged}"
         )
 
     with Finally("I clean up"):
@@ -8395,14 +7702,6 @@ def test_020016(self):
             f"cluster.insecure are unset; ConfigMap keys: {list(data.keys())}"
         )
 
-    with And("Common ConfigMap omits chop-generated-common-listeners.xml (byte-identity for non-adopters)"):
-        cm = kubectl.get("configmap", f"chk-{chk}-common-configd")
-        data = cm.get("data", {})
-        assert "chop-generated-common-listeners.xml" not in data, error(
-            "chop-generated-common-listeners.xml (plaintext-port removal) must be absent for a "
-            f"legacy CHK; ConfigMap keys: {list(data.keys())}"
-        )
-
     with And("Liveness probe uses bash /dev/tcp ruok (NOT pgrep fallback)"):
         sts = kubectl.get("statefulset", f"chk-{chk}-{cluster}-{host}")
         cmd = sts["spec"]["template"]["spec"]["containers"][0]["livenessProbe"]["exec"]["command"]
@@ -8417,6 +7716,857 @@ def test_020016(self):
         delete_test_namespace()
 
 
+
+@TestScenario
+@Name("test_030001. FIPS build: shipped image binaries embed GOFIPS140=v1.0.0")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Build_ShippedBinaries("1.0")
+)
+def test_030001(self):
+    """Verify FIPS metadata and runtime behavior for shipped image binaries.
+
+    Extracts ``clickhouse-operator`` and ``metrics-exporter`` from the release
+    images (``docker create`` + ``docker cp``, see
+    ``docs/fips_evidence_verification.md`` §5), then runs ``go version -m`` and
+    ``--fips-info`` on the host against those paths.
+
+    Also verifies runtime FIPS behavior reported by ``--fips-info`` for the
+    following ``GODEBUG`` states:
+
+      - unset                 -> enabled true, enforced false
+      - ``GODEBUG=""``        -> enabled true, enforced false
+      - ``fips140=off``       -> enabled false, enforced false
+      - ``fips140=on``        -> enabled true, enforced false
+      - ``fips140=only``      -> enabled true, enforced true
+
+    Requires ``docker`` and ``go`` on the host; does not require a Kubernetes
+    cluster beyond the test shell.
+    """
+
+    gofips_version = "v1.0.0"
+    gofips140_needle = f"GOFIPS140={gofips_version}"
+    operator_version = self.context.operator_version
+    godebug_default = "fips140=on"
+
+    with Given("operator and metrics-exporter binaries are extracted from shipped images"):
+        fips_extract_shipped_binaries()
+
+    op_bin = self.context.fips_op_bin
+    me_bin = self.context.fips_me_bin
+
+    with When("check go version -m <binary> version for operator"):
+        check_binary_go_version(binary_path=op_bin, version=gofips140_needle)
+
+    with Then("check runtime FIPS modes for operator"):
+        check_fips_runtime_modes(
+            binary_path=op_bin,
+            binary="clickhouse-operator",
+            version=operator_version,
+            gofips_version=gofips_version,
+            godebug_default=godebug_default,
+        )
+
+    with When("check go version -m <binary> version for metrics exporter"):
+        check_binary_go_version(binary_path=me_bin, version=gofips140_needle)
+
+    with And("check runtime FIPS modes for metrics-exporter"):
+        check_fips_runtime_modes(
+            binary_path=me_bin,
+            binary="metrics-exporter",
+            version=operator_version,
+            gofips_version=gofips_version,
+            godebug_default=godebug_default,
+        )
+
+@TestScenario
+@Name("test_030002. FIPS build: startup banners with strict chopconf and GODEBUG")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Build_ShippedBinaries_StartupLogs("1.0")
+)
+@Tags("NO_PARALLEL")
+def test_030002(self):
+    """Verify FIPS startup banners from running operator and exporter binaries."""
+    chopconf = "manifests/fips/clickhouse-operator-fips-strict.yaml"
+
+    fips_create_shell_namespace_clickhouse_template()
+    operator_namespace = self.context.operator_namespace
+
+    with Given("strict FIPS operator configuration is applied"):
+        fips_apply_operator_config(chopconf_path=chopconf)
+
+    with When("operator startup logs are fetched"):
+        operator_pod = kubectl.get_operator_pod(ns=operator_namespace)
+        op_logs = get_container_logs(
+            pod=operator_pod,
+            container="clickhouse-operator",
+            ns=operator_namespace,
+        )
+        me_logs = get_container_logs(
+            pod=operator_pod,
+            container="metrics-exporter",
+            ns=operator_namespace,
+        )
+
+    with Then("both containers report runtime.enforced=true in the FIPS banner"):
+        fips_startup_banner_ok(container="clickhouse-operator", logs=op_logs)
+        fips_startup_banner_ok(container="metrics-exporter", logs=me_logs)
+
+@TestScenario
+@Name("test_030003. FIPS CHI/CHK: TLS-only ports and replicated CH traffic")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Config_ExternalTLS("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHIDeploy("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHKDeploy("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_FIPSConfig("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHK_FIPSConfig("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_VersionString("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_NoPlainHTTP("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_NoPlainNative("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHK_NoPlainClientPort("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_NoUnexpectedPorts("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHK_NoUnexpectedPorts("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHK_RaftTLS("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_InternodeTLS("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_FIPSBinary("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_GOFIPS140("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_OnlyTLSPorts("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_HTTPSAPI("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_ClickHouseOverTLS("1.0"),
+)
+@Tags("NO_PARALLEL")
+def test_030003(self):
+    """Verify a FIPS ClickHouse + Keeper deployment runs with TLS-only data paths:
+    FIPS-built ClickHouse, Keeper, and clickhouse-backup binaries; only secure
+    ports exposed; the backup HTTPS API serving over TLS with CA-trust enforcement;
+    and ReplicatedMergeTree data converging over the TLS setup.
+    """
+    chopconf = "manifests/fips/clickhouse-operator-fips-strict.yaml"
+    chi_manifest = "manifests/fips/clickhouse-fips.yaml"
+    chk_manifest = "manifests/fips/clickhouse-keeper-fips.yaml"
+    backup_template = "manifests/fips/clickhouse-fips-backup-template.yaml"
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with Given("strict FIPS operator configuration is applied"):
+        util.apply_operator_config(chopconf)
+
+    with And("test TLS secret is installed"):
+        create_tls_secret_for_fips_hosts(chi=chi, chk=chk)
+
+    with And("external ClickHouse client container is started"):
+        start_external_ch_container()
+
+    with And("FIPS ClickHouse Keeper is deployed with TLS settings"):
+        fips_apply_manifest(
+            manifest_path=chk_manifest,
+            expected_pod_count=2,
+            kind="chk",
+        )
+
+    with Then("Keeper cluster passes essential FIPS checks"):
+        fips_assert_replicas_healthy(
+            workload=chk,
+            expected_count=2,
+            kind="chk",
+        )
+
+    with And("FIPS ClickHouse is deployed with TLS settings"):
+        fips_apply_manifest(
+            manifest_path=chi_manifest,
+            expected_pod_count=2,
+            kind="chi",
+            apply_templates=[backup_template],
+        )
+
+    with Then("ClickHouse cluster passes essential FIPS checks"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=2,
+            kind="chi",
+        )
+
+    chi_pod0 = chi_pods[0]
+
+    with And("each clickhouse-backup sidecar uses a FIPS-built binary"):
+        for pod in chi_pods:
+            version = get_binary_version(
+                pod=pod,
+                binary="/bin/clickhouse-backup",
+                container="clickhouse-backup",
+            )
+            note(f"{pod} clickhouse-backup --version: {version}")
+            assert "fips" in version.lower(), error(
+                f"{pod}: expected fips in clickhouse-backup version, got {version!r}"
+            )
+
+    with And("each clickhouse-backup sidecar embeds GOFIPS metadata"):
+        check_clickhouse_backup_embeds_gofips(pods=chi_pods)
+
+    with And("clickhouse-backup sidecar exposes only its TLS API port"):
+        for pod in chi_pods:
+            fips_assert_only_tls_ports(
+                pod=pod,
+                required={8443, 9010, 9440, 7171},
+                container="clickhouse-backup",
+            )
+
+    with And("clickhouse-backup HTTPS API serves over TLS with the FIPS cert"):
+        check_clickhouse_backup_https_api_serves_tls(pods=chi_pods)
+
+    with And("clickhouse-backup HTTPS API rejects untrusted clients"):
+        check_clickhouse_backup_https_api_rejects_untrusted(pods=chi_pods)
+
+    with And("external ClickHouse client reports a FIPS server version"):
+        check_external_clickhouse_reports_fips_version(pod=chi_pod0)
+
+    with And("operator-generated ClickHouse config removes plaintext ports"):
+        settings_xml = fips_read_chop_generated_settings(pod=chi_pod0)
+        note(f"chop-generated-settings.xml:\n{settings_xml}")
+        check_ports_in_chi_settings(settings_xml=settings_xml)
+
+    with Then("ReplicatedMergeTree data converges over the TLS setup"):
+        fips_check_replication_across_replicas(chi_pods=chi_pods)
+
+    with Finally("external ClickHouse client container is removed"):
+        stop_external_ch_container()
+
+
+@TestScenario
+@Name("test_030004. FIPS CHI: scale replicas 2 -> 3 -> 1")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_ScaleUp("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_ScaleDown("1.0"),
+)
+@Tags("NO_PARALLEL")
+def test_030004(self):
+    """Verify FIPS ClickHouse survives replica scale-up and scale-down.
+
+    Starts from the base FIPS CHI manifest with two replicas, upscales to three,
+    then downscales to one. Each stage reuses the base manifest via a temp copy
+    with an edited ``replicasCount``.
+    """
+    chopconf = "manifests/fips/clickhouse-operator-fips-strict.yaml"
+    chi_manifest = "manifests/fips/clickhouse-fips.yaml"
+    chk_manifest = "manifests/fips/clickhouse-keeper-fips.yaml"
+    backup_template = "manifests/fips/clickhouse-fips-backup-template.yaml"
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with Given("strict FIPS operator configuration is applied"):
+        util.apply_operator_config(chopconf)
+
+    with And("test TLS secret covers up to 3 CHI replicas"):
+        create_tls_secret_for_fips_hosts(chi=chi, chk=chk, replicas=3)
+
+    with And("external ClickHouse client container is started"):
+        start_external_ch_container()
+
+    with And("FIPS ClickHouse Keeper is deployed with TLS settings"):
+        fips_apply_manifest(
+            manifest_path=chk_manifest,
+            expected_pod_count=2,
+            kind="chk",
+        )
+
+    with When("FIPS ClickHouse is deployed with 2 replicas"):
+        chi_manifest_2 = fips_edit_manifest(
+            source_manifest=chi_manifest,
+            replicas_count=2,
+            kind="chi",
+        )
+        fips_apply_manifest(
+            manifest_path=chi_manifest_2,
+            expected_pod_count=2,
+            kind="chi",
+            apply_templates=[backup_template],
+        )
+
+    with Then("2-replica cluster passes essential FIPS checks"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=2,
+            kind="chi",
+        )
+
+    with And("ReplicatedMergeTree data converges across 2 replicas"):
+        fips_check_replication_across_replicas(chi_pods=chi_pods)
+
+    with When("CHI is upscaled to 3 replicas"):
+        chi_manifest_3 = fips_edit_manifest(
+            source_manifest=chi_manifest,
+            replicas_count=3,
+            kind="chi",
+        )
+        fips_apply_manifest(
+            manifest_path=chi_manifest_3,
+            expected_pod_count=3,
+            kind="chi",
+        )
+
+    with Then("3-replica cluster passes essential FIPS checks"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=3,
+            kind="chi",
+        )
+
+    with And("ReplicatedMergeTree data converges across 3 replicas"):
+        fips_check_replication_across_replicas(
+            chi_pods=chi_pods,
+            table="repl_scale_test_3",
+        )
+
+    with When("CHI is downscaled to 1 replica"):
+        chi_manifest_1 = fips_edit_manifest(
+            source_manifest=chi_manifest,
+            replicas_count=1,
+            kind="chi",
+        )
+        fips_apply_manifest(
+            manifest_path=chi_manifest_1,
+            expected_pod_count=1,
+            kind="chi",
+        )
+
+    with Then("single-replica cluster passes essential FIPS checks"):
+        fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=1,
+            kind="chi",
+        )
+
+    with Finally("external ClickHouse client container is removed"):
+        stop_external_ch_container()
+
+
+@TestScenario
+@Name("test_030005. FIPS CHK: scale replicas 2 -> 3 -> 1")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHK_ScaleUp("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHK_ScaleDown("1.0"),
+)
+@Tags("NO_PARALLEL")
+def test_030005(self):
+    """Verify FIPS ClickHouse Keeper survives replica scale-up and scale-down.
+
+    Starts from the base FIPS CHK manifest with two replicas, upscales to three,
+    then downscales to one. A fixed two-replica FIPS CHI is deployed alongside
+    to confirm ClickHouse stays connected after each CHK scale.
+    """
+    chopconf = "manifests/fips/clickhouse-operator-fips-strict.yaml"
+    chi_manifest = "manifests/fips/clickhouse-fips.yaml"
+    chk_manifest = "manifests/fips/clickhouse-keeper-fips.yaml"
+    backup_template = "manifests/fips/clickhouse-fips-backup-template.yaml"
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with Given("strict FIPS operator configuration is applied"):
+        util.apply_operator_config(chopconf)
+
+    with And("test TLS secret covers up to 3 CHI and CHK replicas"):
+        create_tls_secret_for_fips_hosts(chi=chi, chk=chk, replicas=3)
+
+    with And("external ClickHouse client container is started"):
+        start_external_ch_container()
+
+    with When("FIPS ClickHouse Keeper is deployed with 2 replicas"):
+        chk_manifest_2 = fips_edit_manifest(
+            source_manifest=chk_manifest,
+            replicas_count=2,
+            kind="chk",
+        )
+        fips_apply_manifest(
+            manifest_path=chk_manifest_2,
+            expected_pod_count=2,
+            kind="chk",
+        )
+
+    with Then("2-replica Keeper cluster passes essential FIPS checks"):
+        fips_assert_replicas_healthy(
+            workload=chk,
+            expected_count=2,
+            kind="chk",
+        )
+
+    with And("FIPS ClickHouse is deployed with 2 replicas"):
+        chi_manifest_2 = fips_edit_manifest(
+            source_manifest=chi_manifest,
+            replicas_count=2,
+            kind="chi",
+        )
+        fips_apply_manifest(
+            manifest_path=chi_manifest_2,
+            expected_pod_count=2,
+            kind="chi",
+            apply_templates=[backup_template],
+        )
+
+    with And("2-replica ClickHouse cluster passes essential FIPS checks"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=2,
+            kind="chi",
+        )
+
+    with And("ReplicatedMergeTree data converges across 2 ClickHouse replicas"):
+        fips_check_replication_across_replicas(chi_pods=chi_pods)
+
+    with When("CHK is upscaled to 3 replicas"):
+        chk_manifest_3 = fips_edit_manifest(
+            source_manifest=chk_manifest,
+            replicas_count=3,
+            kind="chk",
+        )
+        fips_apply_manifest(
+            manifest_path=chk_manifest_3,
+            expected_pod_count=3,
+            kind="chk",
+        )
+
+    with Then("3-replica Keeper cluster passes essential FIPS checks"):
+        fips_assert_replicas_healthy(
+            workload=chk,
+            expected_count=3,
+            kind="chk",
+        )
+
+    with And("ClickHouse remains healthy after Keeper upscale"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=2,
+            kind="chi",
+        )
+
+    with And("ReplicatedMergeTree data still converges after Keeper upscale"):
+        fips_check_replication_across_replicas(
+            chi_pods=chi_pods,
+            table="repl_chk_scale_test_3",
+        )
+
+    with When("CHK is downscaled to 1 replica"):
+        chk_manifest_1 = fips_edit_manifest(
+            source_manifest=chk_manifest,
+            replicas_count=1,
+            kind="chk",
+        )
+        fips_apply_manifest(
+            manifest_path=chk_manifest_1,
+            expected_pod_count=1,
+            kind="chk",
+        )
+
+    with Then("single-replica Keeper cluster passes essential FIPS checks"):
+        fips_assert_replicas_healthy(
+            workload=chk,
+            expected_count=1,
+            kind="chk",
+        )
+
+    with And("ClickHouse remains healthy after Keeper downscale"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=2,
+            kind="chi",
+        )
+
+    with And("ReplicatedMergeTree data still converges after Keeper downscale"):
+        fips_check_replication_across_replicas(
+            chi_pods=chi_pods,
+            table="repl_chk_scale_test_1",
+        )
+
+    with Finally("external ClickHouse client container is removed"):
+        stop_external_ch_container()
+
+
+@TestScenario
+@Name("test_030006. FIPS enforced: coerces verify, minVersion, and IPC")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_CoerceVerifyStrict("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_CoerceMinVersion13("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_OverrideMinVersion12To13("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_CoerceIPCSecure("1.0"),
+)
+@Tags("NO_PARALLEL")
+def test_030006(self):
+    """Verify ``fips.enforced=true`` coerces relaxed chopconf TLS verify, minVersion, and IPC."""
+    chopconf = (
+        "manifests/fips/clickhouse-operator-fips-enforced-minversion12.yaml"
+    )
+
+    fips_create_shell_namespace_clickhouse_template()
+    operator_namespace = self.context.operator_namespace
+
+    with Given("FIPS chopconf with relaxed verify and IPC is applied"):
+        fips_apply_operator_config(chopconf_path=chopconf)
+
+    with When("operator startup logs are fetched"):
+        operator_pod = kubectl.get_operator_pod(ns=operator_namespace)
+        op_logs = get_container_logs(
+            pod=operator_pod,
+            container="clickhouse-operator",
+            ns=operator_namespace,
+        )
+
+    with Then("operator logs show verify, minVersion, and IPC coercion"):
+        fips_assert_fips_enforced_coercion_in_logs(logs=op_logs)
+
+
+@TestScenario
+@Name("test_030007. FIPS enforced: invalid CHI/CHK specs are rejected")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_RejectVerifyNoneCHI("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_RejectVerifyNoneZK("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_RejectInvalidMinVersion("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_RejectExternalZookeeper("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_RejectCHKBypass("1.0"),
+)
+@Tags("NO_PARALLEL")
+def test_030007(self):
+    """Verify strict FIPS mode rejects non-compliant CHI and CHK specifications."""
+    chopconf = "manifests/fips/clickhouse-operator-fips-strict.yaml"
+    chi_zk_rejected = "manifests/fips/test-073-fips-zk-rejected.yaml"
+    chi_zk_rejected_explicit_false = (
+        "manifests/fips/test-073-fips-zk-rejected-explicit-false.yaml"
+    )
+    chi_bypass_rejected = (
+        "manifests/fips/test-078-chi-fips-bypass-rejected.yaml"
+    )
+    chi_cluster_verify_none = "manifests/chi/test-078-fips-verify-none.yaml"
+    chi_invalid_minversion = (
+        "manifests/fips/test-030-chi-invalid-minversion.yaml"
+    )
+    chi_zk_verify_none = "manifests/fips/test-030-chi-zk-verify-none.yaml"
+    chk_bypass_rejected = (
+        "manifests/fips/test-020009-chk-fips-bypass-rejected.yaml"
+    )
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    with Given("strict FIPS operator configuration is applied"):
+        fips_apply_operator_config(chopconf_path=chopconf)
+
+    with When("CHI references plain-text external ZooKeeper"):
+        chi_zk = yaml_manifest.get_name(util.get_full_path(chi_zk_rejected))
+        fips_apply_manifest_raw(manifest_path=chi_zk_rejected)
+
+    with Then("CHI is aborted with FIPSValidationFailed"):
+        fips_assert_chi_aborted(
+            chi=chi_zk,
+            reason="FIPSValidationFailed",
+            expect_no_sts=True,
+        )
+
+    with When("CHI sets external ZooKeeper secure=false explicitly"):
+        chi_zk_explicit = yaml_manifest.get_name(
+            util.get_full_path(chi_zk_rejected_explicit_false)
+        )
+        fips_apply_manifest_raw(manifest_path=chi_zk_rejected_explicit_false)
+
+    with Then("CHI is aborted with FIPSValidationFailed"):
+        fips_assert_chi_aborted(
+            chi=chi_zk_explicit,
+            reason="FIPSValidationFailed",
+            expect_no_sts=True,
+        )
+
+    with When("CHI sets spec.security.clickhouse.tls.verify=None"):
+        chi_bypass = yaml_manifest.get_name(
+            util.get_full_path(chi_bypass_rejected)
+        )
+        fips_apply_manifest_raw(manifest_path=chi_bypass_rejected)
+
+    with Then("CHI is aborted with FIPSValidationFailed"):
+        fips_assert_chi_aborted(
+            chi=chi_bypass,
+            reason="FIPSValidationFailed",
+            expect_no_sts=True,
+        )
+
+    with When("CHI sets cluster.security.clickhouse.tls.verify=None"):
+        chi_cluster_bypass = yaml_manifest.get_name(
+            util.get_full_path(chi_cluster_verify_none)
+        )
+        fips_apply_manifest_raw(manifest_path=chi_cluster_verify_none)
+
+    with Then("CHI is aborted with FIPSValidationFailed"):
+        fips_assert_chi_aborted(
+            chi=chi_cluster_bypass,
+            reason="FIPSValidationFailed",
+            expect_no_sts=True,
+        )
+
+    with When("CHI sets clickhouse.tls.minVersion to an invalid value"):
+        chi_minversion = yaml_manifest.get_name(
+            util.get_full_path(chi_invalid_minversion)
+        )
+        fips_apply_manifest_raw(manifest_path=chi_invalid_minversion)
+
+    with Then("CHI is aborted with FIPSValidationFailed"):
+        fips_assert_chi_aborted(
+            chi=chi_minversion,
+            reason="FIPSValidationFailed",
+            expect_no_sts=True,
+        )
+
+    with When("CHI sets zookeeper.tls.verify=None"):
+        chi_zk_verify = yaml_manifest.get_name(
+            util.get_full_path(chi_zk_verify_none)
+        )
+        fips_apply_manifest_raw(manifest_path=chi_zk_verify_none)
+
+    with Then("CHI is aborted with FIPSValidationFailed"):
+        fips_assert_chi_aborted(
+            chi=chi_zk_verify,
+            reason="FIPSValidationFailed",
+            expect_no_sts=True,
+        )
+
+    with When("CHK sets spec-level security bypass"):
+        chk_bypass = yaml_manifest.get_name(
+            util.get_full_path(chk_bypass_rejected)
+        )
+        fips_apply_manifest_raw(manifest_path=chk_bypass_rejected)
+
+    with Then("CHK is aborted with FIPSValidationFailed"):
+        fips_assert_chk_aborted(
+            chk=chk_bypass,
+            reason="FIPSValidationFailed",
+            expect_no_sts=True,
+        )
+
+
+@TestScenario
+@Name("test_030008. FIPS image policy Required: admission and runtime checks")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_Required_RejectCHI("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_Required_AcceptCHI("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_Required_RejectCHK("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_Required_RuntimeVersion("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_TagDetection_AltinityFIPS("1.0"),
+)
+@Tags("NO_PARALLEL")
+def test_030008(self):
+    """Verify ``security.images.policy=FIPSRequired`` rejects non-fips images."""
+    chopconf = "manifests/fips/test-074-fips-images-required-chopconf.yaml"
+    chi_non_fips_manifest = (
+        "manifests/fips/test-074-fips-images-required-non-fips.yaml"
+    )
+    chi_fips_manifest = "manifests/fips/test-075-fips-images-required-fips.yaml"
+    chk_non_fips_manifest = (
+        "manifests/fips/test-020010-chk-fips-images-required-non-fips.yaml"
+    )
+    chi_runtime_decoy_manifest = (
+        "manifests/fips/test-079-fips-images-runtime-decoy.yaml"
+    )
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    chi_non_fips = yaml_manifest.get_name(
+        util.get_full_path(chi_non_fips_manifest)
+    )
+    chi_fips = yaml_manifest.get_name(util.get_full_path(chi_fips_manifest))
+    chk_non_fips = yaml_manifest.get_name(
+        util.get_full_path(chk_non_fips_manifest)
+    )
+    chi_decoy = yaml_manifest.get_name(
+        util.get_full_path(chi_runtime_decoy_manifest)
+    )
+
+    with Given("FIPS image policy Required is applied"):
+        fips_apply_operator_config(chopconf_path=chopconf)
+
+    with When("CHI with non-fips image tag is applied"):
+        fips_apply_manifest_raw(manifest_path=chi_non_fips_manifest)
+
+    with Then("CHI is aborted at admission with FIPSImagePolicyViolation"):
+        fips_assert_chi_aborted(
+            chi=chi_non_fips,
+            reason="FIPSImagePolicyViolation",
+            expect_no_sts=True,
+            expect_reason_leading=True,
+        )
+
+    with When("CHK with non-fips image tag is applied"):
+        fips_apply_manifest_raw(manifest_path=chk_non_fips_manifest)
+
+    with Then("CHK is aborted at admission with FIPSImagePolicyViolation"):
+        fips_assert_chk_aborted(
+            chk=chk_non_fips,
+            reason="FIPSImagePolicyViolation",
+            expect_no_sts=True,
+        )
+
+    with When("CHI with altinityfips-tagged image is applied"):
+        fips_apply_manifest(
+            manifest_path=chi_fips_manifest,
+            expected_pod_count=1,
+            kind="chi",
+        )
+
+    with Then("CHI reconciles without image policy violation"):
+        errors = kubectl.get_field("chi", chi_fips, ".status.errors")
+        assert "FIPSImagePolicyViolation" not in errors, error(
+            f"unexpected FIPSImagePolicyViolation in status.errors, got {errors}"
+        )
+
+    with When("runtime decoy image alias is prepared"):
+        decoy_tag = "altinity/clickhouse-server:25.8.16.10002.altinityfips-decoy"
+        stable_tag = "altinity/clickhouse-server:25.8.16.10002.altinitystable"
+        tag_result = subprocess.run(
+            ["docker", "tag", stable_tag, decoy_tag],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if tag_result.returncode != 0:
+            note(
+                f"skipping runtime decoy check: "
+                f"docker tag failed ({tag_result.stderr.strip()})"
+            )
+        else:
+            with And("CHI with fips tag but non-fips binary is applied"):
+                fips_apply_manifest_raw(manifest_path=chi_runtime_decoy_manifest)
+
+            with Then("CHI is aborted at runtime with FIPSImagePolicyViolation"):
+                kubectl.wait_chi_status(chi_decoy, "Aborted")
+                errors = kubectl.get_field("chi", chi_decoy, ".status.errors")
+                assert "FIPSImagePolicyViolation" in errors, error(
+                    f"expected runtime FIPSImagePolicyViolation, got {errors}"
+                )
+
+@TestScenario
+@Name("test_030009. FIPS enforced: operator ClickHouse client rejects TLS servers without TLS 1.3")
+@Tags("NO_PARALLEL")
+def test_030009(self):
+    """Verify operator-side ClickHouse TLS client rejects a server without TLS 1.3.
+
+    The negative CHI manifest deliberately disables TLS 1.3 on the ClickHouse
+    server side. Under strict FIPS operator config, the operator ClickHouse
+    client is coerced to minVersion=1.3 and must fail to communicate with that
+    TLS1.2-only server.
+
+    CHK is intentionally not checked here yet because secure CHK client access
+    is not currently exercised by the operator. The same pattern can be added
+    for CHK once secure CHK client support is available.
+    """
+    chopconf = "manifests/fips/clickhouse-operator-fips-strict.yaml"
+    chi_tls12_manifest = "manifests/fips/test-030013-chi-tls12-only.yaml"
+    chk_manifest = "manifests/fips/clickhouse-keeper-fips.yaml"
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    chi_tls12 = yaml_manifest.get_name(util.get_full_path(chi_tls12_manifest))
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with Given("strict FIPS operator configuration is applied"):
+        fips_apply_operator_config(chopconf_path=chopconf)
+
+    with And("test TLS secret is installed"):
+        create_tls_secret_for_fips_hosts(chi=chi_tls12, chk=chk)
+
+
+    with And("normal CHK is applied"):
+        fips_apply_manifest(
+            manifest_path=chk_manifest,
+            expected_pod_count=2,
+            kind="chk",
+        )
+
+    with Then("normal CHK becomes healthy"):
+        fips_assert_replicas_healthy(
+            workload=chk,
+            expected_count=2,
+            kind="chk",
+        )
+
+    with When("CHI server disables TLS 1.3"):
+        fips_apply_manifest_raw(manifest_path=chi_tls12_manifest)
+
+    with Then("operator rejects CHI because TLS 1.3 cannot be negotiated"):
+        fips_assert_chi_tls_rejected(
+            chi=chi_tls12,
+            min_version="1.3",
+        )
+
+    with And("operator logs show TLS 1.3 client rejection"):
+        operator_pod = kubectl.get_operator_pod(ns=self.context.operator_namespace)
+        logs = get_container_logs(
+            pod=operator_pod,
+            container="clickhouse-operator",
+            ns=self.context.operator_namespace,
+        )
+
+        expected = (
+            "TLS setup OK",
+            "minVersion=1.3",
+            "remote error: tls: protocol version not supported",
+        )
+
+        for needle in expected:
+            assert needle in logs, error(
+                f"expected operator log line not found: {needle}"
+            )
+
+
+@TestScenario
+@Name("test_030010. FIPS on-wire TLS verification: Strict + wrong rootCA fails ClickHouse fetch")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Connect_Operator_ClickHouse("1.0")
+)
+@Tags("NO_PARALLEL")
+def test_030010(self):
+    """Strict verify with a wrong rootCA must fail operator ClickHouse fetch."""
+    tls_secret = "manifests/secret/test-058-secret.yaml"
+    chi_manifest = "manifests/chi/test-077-fips-tls-wrong-ca.yaml"
+    chopconf = "manifests/chopconf/test-077-fips-tls-wrong-ca-chopconf.yaml"
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    operator_namespace = self.context.operator_namespace
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+
+    with Given("test-058 TLS secret is installed"):
+        kubectl.apply(util.get_full_path(tls_secret))
+
+    with When("HTTPS ClickHouse CHI is deployed"):
+        fips_apply_manifest(
+            manifest_path=chi_manifest,
+            expected_pod_count=1,
+            kind="chi",
+            apply_templates=[current().context.clickhouse_template],
+        )
+
+    with And("operator chopconf sets verify=Strict with an unrelated rootCA"):
+        fips_apply_operator_config(chopconf_path=chopconf)
+        kubectl.wait_chi_status(chi, "Completed")
+
+    with Then("chi_clickhouse_metric_fetch_errors is 1 for this CHI"):
+        check_metrics_monitoring(
+            operator_namespace=operator_namespace,
+            operator_pod=kubectl.get_operator_pod(ns=operator_namespace),
+            expect_pattern=(
+                f'^chi_clickhouse_metric_fetch_errors{{[^}}]*chi="{chi}"[^}}]*}} 1$'
+            ),
+        )
+
+    with When("operator configuration is reset to default"):
+        kubectl.delete(
+            util.get_full_path(chopconf, lookup_in_host=False),
+            operator_namespace,
+        )
+        util.restart_operator()
+
+
 def cleanup_chis(self):
     with Given("Cleanup CHIs"):
         ns = kubectl.get("ns", name="", ns="--all-namespaces", ok_to_fail=True)
@@ -8426,6 +8576,7 @@ def cleanup_chis(self):
                 if ns_name.startswith("test") and ns_name != self.context.test_namespace:
                     with Then(f"Delete ns {ns_name}"):
                         util.delete_namespace(namespace = ns_name, delete_chi=True)
+
 
 
 @TestModule

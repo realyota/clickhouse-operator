@@ -8588,7 +8588,6 @@ def test(self):
 
     cleanup_chis(self)
 
-    self.context.fips140_mode = "only"
     # Placeholder for selective test running
     # run_tests = [test_008, test_009]
     # for t in run_tests:

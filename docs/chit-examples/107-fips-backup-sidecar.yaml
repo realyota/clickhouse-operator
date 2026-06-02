@@ -2,7 +2,7 @@ apiVersion: "clickhouse.altinity.com/v1"
 kind: "ClickHouseInstallationTemplate"
 
 metadata:
-  name: test-030003-backup-template
+  name: clickhouse-fips-backup-template
 spec:
   defaults:
     templates:

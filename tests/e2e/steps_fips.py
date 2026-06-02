@@ -1163,3 +1163,138 @@ def fips_assert_chk_tls_rejected(
         workload=f"chk/{chk}",
         min_version=min_version,
     )
+
+@TestStep(Then)
+def check_clickhouse_backup_clickhouse_tls_config(self, pod, ns=None):
+    """Verify clickhouse-backup container is configured to reach ClickHouse via TLS native port."""
+    ns = ns or self.context.test_namespace
+
+    out = kubectl.launch(
+        f"exec {pod} -c clickhouse-backup -- "
+        "sh -c '"
+        "echo PORT:$CLICKHOUSE_PORT; "
+        "echo SECURE:$CLICKHOUSE_SECURE; "
+        "echo TLS_CA:$CLICKHOUSE_TLS_CA; "
+        "echo SKIP_VERIFY:$CLICKHOUSE_SKIP_VERIFY"
+        "'",
+        ns=ns,
+    )
+
+    assert "PORT:9440" in out, error(out)
+    assert "SECURE:true" in out, error(out)
+    assert "TLS_CA:/etc/clickhouse-backup/tls/ca.crt" in out, error(out)
+    assert "SKIP_VERIFY:false" in out, error(out)
+
+
+@TestStep(Then)
+def check_clickhouse_backup_can_list_tables_over_clickhouse_tls(self, pod, ns=None):
+    """Use backup API to prove backup can talk to ClickHouse using its configured TLS path."""
+    ns = ns or self.context.test_namespace
+
+    out = kubectl.launch(
+        f"exec {pod} -c clickhouse-backup -- "
+        "curl -sS "
+        "--cacert /etc/clickhouse-backup/tls/ca.crt "
+        "-o /tmp/backup_tables.out "
+        "-w 'HTTP:%{http_code}' "
+        "https://127.0.0.1:7171/backup/tables",
+        ns=ns,
+    )
+
+    assert out == "HTTP:200", error(out)
+
+@TestStep(Then)
+def check_clickhouse_backup_restore_roundtrip_https(
+    self,
+    pod,
+    table="fips_backup_roundtrip",
+    ns=None,
+):
+    """Create data, backup via HTTPS API, drop data, restore via HTTPS API, verify data."""
+    ns = ns or self.context.test_namespace
+    backup_name = f"{table}_backup"
+
+    def api(method, path):
+        return kubectl.launch(
+            f"exec {pod} -c clickhouse-backup -- "
+            "sh -c "
+            f"\"curl -sS -X {method} "
+            "--cacert /etc/clickhouse-backup/tls/ca.crt "
+            "-o /tmp/backup_api.out "
+            "-w 'HTTP:%{http_code}' "
+            f"'https://127.0.0.1:7171{path}'\"",
+            ns=ns,
+        ).strip()
+
+    with Given("test table exists with data"):
+        fips_ch_external_secure_query(
+            pod=pod,
+            sql=f"DROP TABLE IF EXISTS {table} SYNC",
+        )
+        fips_wait_table_removed_from_dropped_tables(pod=pod, table=table)
+
+        fips_ch_external_secure_query(
+            pod=pod,
+            sql=f"CREATE TABLE {table} (n UInt64) ENGINE = MergeTree ORDER BY n",
+        )
+        fips_ch_external_secure_query(
+            pod=pod,
+            sql=f"INSERT INTO {table} SELECT number FROM numbers(10)",
+        )
+
+    with When("backup is created through HTTPS API"):
+        out = api(
+            "POST",
+            f"/backup/create?name={backup_name}&table=default.{table}",
+        )
+        assert out.startswith("HTTP:2"), error(out)
+
+    with And("table is dropped"):
+        fips_ch_external_secure_query(
+            pod=pod,
+            sql=f"DROP TABLE IF EXISTS {table} SYNC",
+        )
+        fips_wait_table_removed_from_dropped_tables(pod=pod, table=table)
+
+    with And("backup is restored through HTTPS API"):
+        out = api(
+            "POST",
+            f"/backup/restore/{backup_name}?table=default.{table}",
+        )
+        assert out.startswith("HTTP:2"), error(out)
+
+    with Then("restored data is visible through strict TLS ClickHouse client"):
+        fips_poll_secure_scalar(
+            pod=pod,
+            sql=f"SELECT count() FROM {table}",
+            expected=10,
+        )
+@TestStep(Then)
+def fips_wait_table_removed_from_dropped_tables(
+    self,
+    pod,
+    table,
+    database="default",
+    timeout=60,
+):
+    """Wait until Atomic database dropped-table metadata no longer reserves the table UUID."""
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        out = fips_ch_external_secure_query(
+            pod=pod,
+            sql=(
+                "SELECT count() "
+                "FROM system.dropped_tables "
+                f"WHERE database = '{database}' AND table = '{table}'"
+            ),
+        )
+
+        if out.strip() == "0":
+            return
+
+        time.sleep(1)
+
+    assert False, error(
+        f"{database}.{table} still present in system.dropped_tables after {timeout}s"
+    )

@@ -355,6 +355,25 @@ def fips_assert_chk_aborted(self, chk, reason=None, expect_no_sts=False):
         )
 
 
+@TestStep(Then)
+def fips_assert_chi_admitted(self, chi, reason="FIPSImagePolicyViolation"):
+    """Wait for at least one StatefulSet and assert no image-policy violation.
+
+    Used for acceptance tests where the image may not be pullable but the
+    operator must not abort the CHI with ``reason``.
+    """
+    kubectl.wait_object(
+        "sts",
+        "",
+        label=f"-l clickhouse.altinity.com/chi={chi}",
+        count=1,
+    )
+    errors = kubectl.get_field("chi", chi, ".status.errors")
+    assert reason not in errors, error(
+        f"unexpected {reason} in status.errors, got {errors}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # TLS secrets
 # ---------------------------------------------------------------------------

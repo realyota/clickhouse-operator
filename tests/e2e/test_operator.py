@@ -8353,11 +8353,18 @@ def test_030007(self):
     RQ_SRS_026_ClickHouseOperator_FIPS_Images_Required_AcceptCHI("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_Images_Required_RejectCHK("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_Images_Required_RuntimeVersion("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_Required_ShortCircuit("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_Images_TagDetection_AltinityFIPS("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_TagDetection_FIPSSuffix("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_TagDetection_CaseInsensitive("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_TagDetection_DigestOnly("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_TagDetection_RegistryPath("1.0"),
 )
 @Tags("NO_PARALLEL")
 def test_030008(self):
-    """Verify ``security.images.policy=FIPSRequired`` rejects non-fips images."""
+    """Verify ``security.images.policy=FIPSRequired`` rejects non-fips images
+    and accepts images whose tags contain ``fips`` (case-insensitive).
+    """
     chopconf = "manifests/chopconf/test-074-fips-images-required-chopconf.yaml"
     chi_non_fips_manifest = (
         "manifests/chi/test-074-fips-images-required-non-fips.yaml"
@@ -8368,6 +8375,21 @@ def test_030008(self):
     )
     chi_runtime_decoy_manifest = (
         "manifests/chi/test-030008-runtime-decoy.yaml"
+    )
+    chi_shortcircuit_manifest = (
+        "manifests/chi/test-030008-shortcircuit.yaml"
+    )
+    chi_digest_only_manifest = (
+        "manifests/chi/test-030008-digest-only.yaml"
+    )
+    chi_registry_path_manifest = (
+        "manifests/chi/test-030008-registry-path.yaml"
+    )
+    chi_fips_suffix_manifest = (
+        "manifests/chi/test-030008-fips-suffix.yaml"
+    )
+    chi_case_insensitive_manifest = (
+        "manifests/chi/test-030008-case-insensitive.yaml"
     )
 
     fips_create_shell_namespace_clickhouse_template()
@@ -8381,6 +8403,21 @@ def test_030008(self):
     )
     chi_decoy = yaml_manifest.get_name(
         util.get_full_path(chi_runtime_decoy_manifest)
+    )
+    chi_shortcircuit = yaml_manifest.get_name(
+        util.get_full_path(chi_shortcircuit_manifest)
+    )
+    chi_digest_only = yaml_manifest.get_name(
+        util.get_full_path(chi_digest_only_manifest)
+    )
+    chi_registry_path = yaml_manifest.get_name(
+        util.get_full_path(chi_registry_path_manifest)
+    )
+    chi_fips_suffix = yaml_manifest.get_name(
+        util.get_full_path(chi_fips_suffix_manifest)
+    )
+    chi_case_insensitive = yaml_manifest.get_name(
+        util.get_full_path(chi_case_insensitive_manifest)
     )
 
     with Given("FIPS image policy Required is applied"):
@@ -8407,6 +8444,42 @@ def test_030008(self):
             expect_no_sts=True,
         )
 
+    with When("CHI with two non-fips replicas is applied"):
+        fips_apply_manifest_raw(manifest_path=chi_shortcircuit_manifest)
+
+    with Then("CHI is aborted with a single FIPSImagePolicyViolation"):
+        fips_assert_chi_aborted(
+            chi=chi_shortcircuit,
+            reason="FIPSImagePolicyViolation",
+            expect_no_sts=True,
+        )
+        errors = kubectl.get_field("chi", chi_shortcircuit, ".status.errors")
+        violation_count = errors.count("FIPSImagePolicyViolation")
+        assert violation_count == 1, error(
+            f"expected exactly 1 FIPSImagePolicyViolation for multi-host CHI, "
+            f"got {violation_count} in: {errors}"
+        )
+
+    with When("CHI with digest-only image reference is applied"):
+        fips_apply_manifest_raw(manifest_path=chi_digest_only_manifest)
+
+    with Then("CHI is aborted because digest-only is not detected as FIPS"):
+        fips_assert_chi_aborted(
+            chi=chi_digest_only,
+            reason="FIPSImagePolicyViolation",
+            expect_no_sts=True,
+        )
+
+    with When("CHI with fips in registry hostname but not in tag is applied"):
+        fips_apply_manifest_raw(manifest_path=chi_registry_path_manifest)
+
+    with Then("CHI is aborted because registry path does not satisfy FIPS tag detection"):
+        fips_assert_chi_aborted(
+            chi=chi_registry_path,
+            reason="FIPSImagePolicyViolation",
+            expect_no_sts=True,
+        )
+
     with When("CHI with altinityfips-tagged image is applied"):
         fips_apply_manifest(
             manifest_path=chi_fips_manifest,
@@ -8419,6 +8492,18 @@ def test_030008(self):
         assert "FIPSImagePolicyViolation" not in errors, error(
             f"unexpected FIPSImagePolicyViolation in status.errors, got {errors}"
         )
+
+    with When("CHI with fips-suffix tag is applied"):
+        fips_apply_manifest_raw(manifest_path=chi_fips_suffix_manifest)
+
+    with Then("CHI is admitted because tag contains fips"):
+        fips_assert_chi_admitted(chi=chi_fips_suffix)
+
+    with When("CHI with uppercase FIPS tag is applied"):
+        fips_apply_manifest_raw(manifest_path=chi_case_insensitive_manifest)
+
+    with Then("CHI is admitted because tag detection is case-insensitive"):
+        fips_assert_chi_admitted(chi=chi_case_insensitive)
 
     with When("runtime decoy image alias is prepared"):
         decoy_tag = "altinity/clickhouse-server:25.8.16.10002.altinityfips-decoy"

@@ -377,11 +377,12 @@ def create_tls_secret_for_fips_hosts(
     server_csr = os.path.join(certs_dir, "server.csr")
     server_crt = os.path.join(certs_dir, "server.crt")
     openssl_cnf = os.path.join(certs_dir, "openssl.cnf")
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    dhparam = os.path.join(
-        repo_root,
-        "tests/e2e/manifests/secret/dhparam.pem",
-    )
+    dhparam = os.path.join(certs_dir, "dhparam.pem")
+
+    with open(util.get_full_path("manifests/secret/clickhouse-certs.yaml"), encoding="utf-8") as f:
+        dhparam_content = yaml.safe_load(f)["stringData"]["dhparam.pem"]
+    with open(dhparam, "w", encoding="utf-8") as f:
+        f.write(dhparam_content)
 
     dns_suffixes = ("", f".{ns}", f".{ns}.svc", f".{ns}.svc.cluster.local")
     dns_names = ["localhost", "clickhouse", "clickhouse1", f"*.{ns}.svc.cluster.local"]
@@ -664,10 +665,11 @@ def fips_edit_manifest(self, source_manifest, replicas_count=None, kind="chi"):
 def fips_apply_manifest(
     self,
     manifest_path,
-    expected_pod_count,
+    expected_pod_count=None,
     kind="chi",
     apply_templates=None,
     timeout=None,
+    expected_status=None,
 ):
     """Apply a CHI/CHK manifest and wait for reconcile plus pod readiness."""
     if kind == "chi":
@@ -678,9 +680,15 @@ def fips_apply_manifest(
         raise ValueError(f"unsupported manifest kind: {kind}")
 
     check = {
-        "pod_count": expected_pod_count,
         "do_not_delete": 1,
     }
+    if expected_pod_count is not None:
+        check["pod_count"] = expected_pod_count
+    if expected_status is not None:
+        if kind == "chi":
+            check["chi_status"] = expected_status
+        elif kind == "chk":
+            check["chk_status"] = expected_status
     if apply_templates:
         check["apply_templates"] = apply_templates
 
@@ -1090,7 +1098,19 @@ def fips_assert_chi_tls_rejected(
     min_version="1.3",
 ):
     """Assert CHI remains unfinished because operator TLS client rejects server TLS policy."""
-    kubectl.wait_chi_status(chi, expected_status)
+    kubectl.wait_object(
+        "pod",
+        "",
+        label=f"-l clickhouse.altinity.com/chi={chi}",
+        count=1,
+    )
+
+    status = kubectl.get_chi_status(chi)
+    assert status != "Completed", error(
+        f"CHI {chi} reached Completed; expected operator TLS client to reject the server"
+    )
+    if status != expected_status:
+        kubectl.wait_chi_status(chi, expected_status)
 
     fips_assert_operator_tls_rejection_in_logs(
         workload=f"chi/{chi}",
@@ -1106,7 +1126,19 @@ def fips_assert_chk_tls_rejected(
     min_version="1.3",
 ):
     """Assert CHK remains unfinished because operator TLS client rejects server TLS policy."""
-    kubectl.wait_chk_status(chk, expected_status)
+    kubectl.wait_object(
+        "pod",
+        "",
+        label=f"-l clickhouse-keeper.altinity.com/chk={chk}",
+        count=1,
+    )
+
+    status = kubectl.get_field("chk", chk, ".status.status")
+    assert status != "Completed", error(
+        f"CHK {chk} reached Completed; expected operator TLS client to reject the server"
+    )
+    if status != expected_status:
+        kubectl.wait_chk_status(chk, expected_status)
 
     fips_assert_operator_tls_rejection_in_logs(
         workload=f"chk/{chk}",

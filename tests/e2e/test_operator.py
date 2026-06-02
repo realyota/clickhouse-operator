@@ -7786,7 +7786,7 @@ def test_030001(self):
 @Tags("NO_PARALLEL")
 def test_030002(self):
     """Verify FIPS startup banners from running operator and exporter binaries."""
-    chopconf = "manifests/fips/clickhouse-operator-fips-strict.yaml"
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
 
     fips_create_shell_namespace_clickhouse_template()
     operator_namespace = self.context.operator_namespace
@@ -7840,10 +7840,10 @@ def test_030003(self):
     ports exposed; the backup HTTPS API serving over TLS with CA-trust enforcement;
     and ReplicatedMergeTree data converging over the TLS setup.
     """
-    chopconf = "manifests/fips/clickhouse-operator-fips-strict.yaml"
-    chi_manifest = "manifests/fips/clickhouse-fips.yaml"
-    chk_manifest = "manifests/fips/clickhouse-keeper-fips.yaml"
-    backup_template = "manifests/fips/clickhouse-fips-backup-template.yaml"
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
+    chi_manifest = "manifests/chi/test-030003.yaml"
+    chk_manifest = "manifests/chk/test-030003.yaml"
+    backup_template = "manifests/chit/test-030003-backup-template.yaml"
 
     fips_create_shell_namespace_clickhouse_template()
 
@@ -7948,10 +7948,10 @@ def test_030004(self):
     then downscales to one. Each stage reuses the base manifest via a temp copy
     with an edited ``replicasCount``.
     """
-    chopconf = "manifests/fips/clickhouse-operator-fips-strict.yaml"
-    chi_manifest = "manifests/fips/clickhouse-fips.yaml"
-    chk_manifest = "manifests/fips/clickhouse-keeper-fips.yaml"
-    backup_template = "manifests/fips/clickhouse-fips-backup-template.yaml"
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
+    chi_manifest = "manifests/chi/test-030003.yaml"
+    chk_manifest = "manifests/chk/test-030003.yaml"
+    backup_template = "manifests/chit/test-030003-backup-template.yaml"
 
     fips_create_shell_namespace_clickhouse_template()
 
@@ -8059,10 +8059,10 @@ def test_030005(self):
     then downscales to one. A fixed two-replica FIPS CHI is deployed alongside
     to confirm ClickHouse stays connected after each CHK scale.
     """
-    chopconf = "manifests/fips/clickhouse-operator-fips-strict.yaml"
-    chi_manifest = "manifests/fips/clickhouse-fips.yaml"
-    chk_manifest = "manifests/fips/clickhouse-keeper-fips.yaml"
-    backup_template = "manifests/fips/clickhouse-fips-backup-template.yaml"
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
+    chi_manifest = "manifests/chi/test-030003.yaml"
+    chk_manifest = "manifests/chk/test-030003.yaml"
+    backup_template = "manifests/chit/test-030003-backup-template.yaml"
 
     fips_create_shell_namespace_clickhouse_template()
 
@@ -8200,7 +8200,7 @@ def test_030005(self):
 def test_030006(self):
     """Verify ``fips.enforced=true`` coerces relaxed chopconf TLS verify, minVersion, and IPC."""
     chopconf = (
-        "manifests/fips/clickhouse-operator-fips-enforced-minversion12.yaml"
+        "manifests/chopconf/test-030006-chopconf.yaml"
     )
 
     fips_create_shell_namespace_clickhouse_template()
@@ -8233,21 +8233,21 @@ def test_030006(self):
 @Tags("NO_PARALLEL")
 def test_030007(self):
     """Verify strict FIPS mode rejects non-compliant CHI and CHK specifications."""
-    chopconf = "manifests/fips/clickhouse-operator-fips-strict.yaml"
-    chi_zk_rejected = "manifests/fips/test-073-fips-zk-rejected.yaml"
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
+    chi_zk_rejected = "manifests/chi/test-073-fips-zk-rejected.yaml"
     chi_zk_rejected_explicit_false = (
-        "manifests/fips/test-073-fips-zk-rejected-explicit-false.yaml"
+        "manifests/chi/test-073-fips-zk-rejected-explicit-false.yaml"
     )
     chi_bypass_rejected = (
-        "manifests/fips/test-078-chi-fips-bypass-rejected.yaml"
+        "manifests/chi/test-030007-chi-bypass-rejected.yaml"
     )
     chi_cluster_verify_none = "manifests/chi/test-078-fips-verify-none.yaml"
     chi_invalid_minversion = (
-        "manifests/fips/test-030-chi-invalid-minversion.yaml"
+        "manifests/chi/test-030007-invalid-minversion.yaml"
     )
-    chi_zk_verify_none = "manifests/fips/test-030-chi-zk-verify-none.yaml"
+    chi_zk_verify_none = "manifests/chi/test-030007-zk-verify-none.yaml"
     chk_bypass_rejected = (
-        "manifests/fips/test-020009-chk-fips-bypass-rejected.yaml"
+        "manifests/chk/test-020009-chk-fips-bypass-rejected.yaml"
     )
 
     fips_create_shell_namespace_clickhouse_template()
@@ -8357,16 +8357,16 @@ def test_030007(self):
 @Tags("NO_PARALLEL")
 def test_030008(self):
     """Verify ``security.images.policy=FIPSRequired`` rejects non-fips images."""
-    chopconf = "manifests/fips/test-074-fips-images-required-chopconf.yaml"
+    chopconf = "manifests/chopconf/test-074-fips-images-required-chopconf.yaml"
     chi_non_fips_manifest = (
-        "manifests/fips/test-074-fips-images-required-non-fips.yaml"
+        "manifests/chi/test-074-fips-images-required-non-fips.yaml"
     )
-    chi_fips_manifest = "manifests/fips/test-075-fips-images-required-fips.yaml"
+    chi_fips_manifest = "manifests/chi/test-075-fips-images-required-fips.yaml"
     chk_non_fips_manifest = (
-        "manifests/fips/test-020010-chk-fips-images-required-non-fips.yaml"
+        "manifests/chk/test-020010-chk-fips-images-required-non-fips.yaml"
     )
     chi_runtime_decoy_manifest = (
-        "manifests/fips/test-079-fips-images-runtime-decoy.yaml"
+        "manifests/chi/test-030008-runtime-decoy.yaml"
     )
 
     fips_create_shell_namespace_clickhouse_template()
@@ -8445,27 +8445,25 @@ def test_030008(self):
                 )
 
 @TestScenario
-@Name("test_030009. FIPS enforced: operator ClickHouse client rejects TLS servers without TLS 1.3")
+@Name("test_030009. FIPS enforced: operator TLS clients reject servers without TLS 1.3")
 @Tags("NO_PARALLEL")
 def test_030009(self):
-    """Verify operator-side ClickHouse TLS client rejects a server without TLS 1.3.
+    """Verify operator-side TLS clients reject servers without TLS 1.3.
 
-    The negative CHI manifest deliberately disables TLS 1.3 on the ClickHouse
-    server side. Under strict FIPS operator config, the operator ClickHouse
-    client is coerced to minVersion=1.3 and must fail to communicate with that
-    TLS1.2-only server.
-
-    CHK is intentionally not checked here yet because secure CHK client access
-    is not currently exercised by the operator. The same pattern can be added
-    for CHK once secure CHK client support is available.
+    Negative CHI and CHK manifests deliberately disable TLS 1.3 on the server
+    side. Under strict FIPS operator config, operator TLS clients are coerced
+    to minVersion=1.3 and must fail to communicate with those TLS1.2-only
+    servers.
     """
-    chopconf = "manifests/fips/clickhouse-operator-fips-strict.yaml"
-    chi_tls12_manifest = "manifests/fips/test-030013-chi-tls12-only.yaml"
-    chk_manifest = "manifests/fips/clickhouse-keeper-fips.yaml"
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
+    chi_tls12_manifest = "manifests/chi/test-030009-chi-tls12-only.yaml"
+    chk_tls12_manifest = "manifests/chk/test-030009-chk-tls12-only.yaml"
+    chk_manifest = "manifests/chk/test-030003.yaml"
 
     fips_create_shell_namespace_clickhouse_template()
 
     chi_tls12 = yaml_manifest.get_name(util.get_full_path(chi_tls12_manifest))
+    chk_tls12 = yaml_manifest.get_name(util.get_full_path(chk_tls12_manifest))
     chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
 
     with Given("strict FIPS operator configuration is applied"):
@@ -8473,7 +8471,6 @@ def test_030009(self):
 
     with And("test TLS secret is installed"):
         create_tls_secret_for_fips_hosts(chi=chi_tls12, chk=chk)
-
 
     with And("normal CHK is applied"):
         fips_apply_manifest(
@@ -8490,7 +8487,11 @@ def test_030009(self):
         )
 
     with When("CHI server disables TLS 1.3"):
-        fips_apply_manifest_raw(manifest_path=chi_tls12_manifest)
+        fips_apply_manifest(
+            manifest_path=chi_tls12_manifest,
+            kind="chi",
+            expected_status="InProgress",
+        )
 
     with Then("operator rejects CHI because TLS 1.3 cannot be negotiated"):
         fips_assert_chi_tls_rejected(
@@ -8498,24 +8499,18 @@ def test_030009(self):
             min_version="1.3",
         )
 
-    with And("operator logs show TLS 1.3 client rejection"):
-        operator_pod = kubectl.get_operator_pod(ns=self.context.operator_namespace)
-        logs = get_container_logs(
-            pod=operator_pod,
-            container="clickhouse-operator",
-            ns=self.context.operator_namespace,
+    with When("CHK server disables TLS 1.3"):
+        fips_apply_manifest(
+            manifest_path=chk_tls12_manifest,
+            kind="chk",
+            expected_status="InProgress",
         )
 
-        expected = (
-            "TLS setup OK",
-            "minVersion=1.3",
-            "remote error: tls: protocol version not supported",
+    with Then("operator rejects CHK because TLS 1.3 cannot be negotiated"):
+        fips_assert_chk_tls_rejected(
+            chk=chk_tls12,
+            min_version="1.3",
         )
-
-        for needle in expected:
-            assert needle in logs, error(
-                f"expected operator log line not found: {needle}"
-            )
 
 
 @TestScenario
@@ -8593,6 +8588,7 @@ def test(self):
 
     cleanup_chis(self)
 
+    self.context.fips140_mode = "only"
     # Placeholder for selective test running
     # run_tests = [test_008, test_009]
     # for t in run_tests:

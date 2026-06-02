@@ -5,7 +5,7 @@ metadata:
 spec:
   defaults:
     templates:
-      podTemplate: clickhouse-fips
+      podTemplate: test-030009
   templates:
     podTemplates:
       - name: test-030009
@@ -19,8 +19,6 @@ spec:
         rootCASecretRef:
           name: clickhouse-certs
           key: ca.crt
-  useTemplates:
-    - name: test-030009-backup-template
   configuration:
     clusters:
       - name: default
@@ -32,7 +30,7 @@ spec:
     zookeeper:
       nodes:
         - host: chk-test-030003-keeper-0-0
-          port: 9281
+          port: 2281
           secure: "yes"
     settings:
       http_port: _removed_

@@ -662,6 +662,10 @@ def get_pod_names(chi_name, ns=None, shell=None):
     return get_obj_names(chi_name, "pods", kind="chi", ns=ns, shell=shell)
 
 
+def get_chk_pod_names(chk_name, ns=None, shell=None):
+    return get_obj_names(chk_name, "pods", kind="chk", ns=ns, shell=shell)
+
+
 def get_obj_names(chi_name, obj_type="pods", kind = "chi", ns=None, shell=None):
     label = ""
     if kind == "chi":

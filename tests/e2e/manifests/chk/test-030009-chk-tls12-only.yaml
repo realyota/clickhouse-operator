@@ -9,14 +9,13 @@ spec:
   configuration:
     clusters:
       - name: keeper
+        secure: "yes"
+        insecure: "no"
         layout:
           replicasCount: 2
     settings:
-      keeper_server/tcp_port: _removed_
-      keeper_server/tcp_port_secure: 9281
       keeper_server/log_storage_path: /var/lib/clickhouse/coordination/log
       keeper_server/snapshot_storage_path: /var/lib/clickhouse/coordination/snapshots
-      keeper_server/raft_configuration/secure: "true"
       keeper_server/raft_configuration/server/port: 9444
     files:
       openssl.xml: |
@@ -63,15 +62,3 @@ spec:
             - name: clickhouse-keeper
               image: altinity/clickhouse-keeper:25.3.8.30001.altinityfips
               imagePullPolicy: IfNotPresent
-              livenessProbe:  # temporary workaround for port 2181
-                exec:
-                  command:
-                    - bash
-                    - -c
-                    - pgrep clickhouse-keeper
-              readinessProbe:  # temporary workaround for port 2181
-                exec:
-                  command:
-                    - bash
-                    - -c
-                    - pgrep clickhouse-keeper

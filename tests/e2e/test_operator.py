@@ -6378,7 +6378,9 @@ def test_010065_0(self):
 
 @TestScenario
 @Name("test_010065. FIPS IPC Secure mode: operator↔exporter token-protected channel")
-@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Connect_Operator_IPCSecure("1.0")
+)
 def test_010065(self):
     """Verify clickhouse.security.ipc.mode=Secure activates token-based auth
     on the operator↔metrics-exporter /chi REST channel without breaking the
@@ -7814,7 +7816,7 @@ def test_030002(self):
 @TestScenario
 @Name("test_030003. FIPS CHI/CHK: TLS-only ports and replicated CH traffic")
 @Requirements(
-    RQ_SRS_026_ClickHouseOperator_FIPS_Config_ExternalTLS("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Connect_Operator_Listeners("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHIDeploy("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHKDeploy("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_FIPSConfig("1.0"),
@@ -7831,7 +7833,6 @@ def test_030002(self):
     RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_GOFIPS140("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_OnlyTLSPorts("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_HTTPSAPI("1.0"),
-    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_ClickHouseOverTLS("1.0"),
 )
 @Tags("NO_PARALLEL")
 def test_030003(self):
@@ -8446,6 +8447,10 @@ def test_030008(self):
 
 @TestScenario
 @Name("test_030009. FIPS enforced: operator TLS clients reject servers without TLS 1.3")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_CoerceMinVersion13("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_MinVersionScope("1.0"),
+)
 @Tags("NO_PARALLEL")
 def test_030009(self):
     """Verify operator-side TLS clients reject servers without TLS 1.3.
@@ -8515,9 +8520,6 @@ def test_030009(self):
 
 @TestScenario
 @Name("test_030010. FIPS on-wire TLS verification: Strict + wrong rootCA fails ClickHouse fetch")
-@Requirements(
-    RQ_SRS_026_ClickHouseOperator_FIPS_Connect_Operator_ClickHouse("1.0")
-)
 @Tags("NO_PARALLEL")
 def test_030010(self):
     """Strict verify with a wrong rootCA must fail operator ClickHouse fetch."""

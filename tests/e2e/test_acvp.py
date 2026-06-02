@@ -43,6 +43,13 @@ import hashlib
 from testflows.core import *
 from testflows.asserts import error
 
+from requirements.fips import (
+    RQ_SRS_026_ClickHouseOperator_FIPS_ACVP_Exporter_ConfigGeneration,
+    RQ_SRS_026_ClickHouseOperator_FIPS_ACVP_Exporter_WrapperIntegration,
+    RQ_SRS_026_ClickHouseOperator_FIPS_ACVP_Operator_ConfigGeneration,
+    RQ_SRS_026_ClickHouseOperator_FIPS_ACVP_Operator_WrapperIntegration,
+)
+
 
 # Repo root resolution: this file lives at tests/e2e/test_acvp.py, so two
 # directory hops upward land on the operator's git root.
@@ -238,6 +245,10 @@ def _acvp_smoke(binary_name, cmd_path):
 
 @TestScenario
 @Name("test_acvp_operator. ACVP responder smoke test: clickhouse-operator binary")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_ACVP_Operator_WrapperIntegration("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_ACVP_Operator_ConfigGeneration("1.0"),
+)
 def test_acvp_operator(self):
     """Build operator with -tags acvp_wrapper and verify the embedded ACVP
     responder answers getConfig + SHA2-256 AFT correctly.
@@ -251,6 +262,10 @@ def test_acvp_operator(self):
 
 @TestScenario
 @Name("test_acvp_metrics_exporter. ACVP responder smoke test: metrics-exporter binary")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_ACVP_Exporter_WrapperIntegration("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_ACVP_Exporter_ConfigGeneration("1.0"),
+)
 def test_acvp_metrics_exporter(self):
     """Mirror of test_acvp_operator for the metrics-exporter binary. Both
     binaries ship the same FIPS module statically linked; this scenario

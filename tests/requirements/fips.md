@@ -258,7 +258,7 @@ SHALL negotiate only TLS 1.3 with the following approved cipher suites.
 
 * TLS_AES_128_GCM_SHA256
 * TLS_AES_256_GCM_SHA384
-* TLS_CHACHA20_POLY1305_SHA256 (not accepted by default, needs to be specified explicitly in all opensshl configs)
+* TLS_CHACHA20_POLY1305_SHA256 (not accepted by default, needs to be specified explicitly in all openssl configs)
 
 ### Rejected Cipher Suites and Protocols
 

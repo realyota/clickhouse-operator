@@ -7586,11 +7586,12 @@ def test_020014(self):
             f"chop-generated-listeners.xml missing; ConfigMap keys: {list(data.keys())}"
         )
         xml = data["chop-generated-listeners.xml"]
-        assert '<tcp_port remove="1"/>' in xml, error(
-            f"expected <tcp_port remove=\"1\"/> suppression in listeners xml:\n{xml}"
+        assert "<tcp_port>" not in xml, error(
+            f"plaintext tcp_port must be absent in listeners xml:\n{xml}"
         )
+
         assert "<tcp_port_secure>2281</tcp_port_secure>" in xml, error(
-            f"expected <tcp_port_secure>2281</tcp_port_secure> in listeners xml:\n{xml}"
+            f"expected tcp_port_secure 2281 in listeners xml:\n{xml}"
         )
 
     with And("Liveness probe falls back to pgrep (4LW unavailable over TLS)"):
@@ -8708,6 +8709,159 @@ def test_030012(self):
     with Then("backup and restore succeeds through HTTPS API"):
         check_clickhouse_backup_restore_roundtrip_https(pod=pod)
 
+    with Finally("external ClickHouse client container is removed"):
+        stop_external_ch_container()
+
+@TestScenario
+@Name("test_030014. FIPS CHI: TLS cipher suite config updates are applied")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_ConfigUpdate("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_TLS_ApprovedCiphers("1.0"),
+)
+@Tags("NO_PARALLEL")
+def test_030014(self):
+    """Verify FIPS CHI reloads TLS cipher suite updates and negotiates only the configured suite."""
+
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
+    chi_manifest = "manifests/chi/test-030003.yaml"
+    chk_manifest = "manifests/chk/test-030003.yaml"
+    backup_template = "manifests/chit/test-030003-backup-template.yaml"
+
+    cipher_suite_cases = (
+        {
+            "allowed": "TLS_AES_128_GCM_SHA256",
+            "rejected": "TLS_AES_256_GCM_SHA384",
+        },
+        {
+            "allowed": "TLS_AES_256_GCM_SHA384",
+            "rejected": "TLS_AES_128_GCM_SHA256",
+        },
+        {
+            "allowed": "TLS_CHACHA20_POLY1305_SHA256",
+            "rejected": "TLS_AES_128_GCM_SHA256",
+        }
+    )
+
+    external_client_cipher_suites = tuple(
+        cipher_suite_case["allowed"]
+        for cipher_suite_case in cipher_suite_cases
+    )
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with Given("strict FIPS operator configuration is applied"):
+        util.apply_operator_config(chopconf)
+
+    with And("test TLS secret is installed"):
+        create_tls_secret_for_fips_hosts(
+            chi=chi,
+            chk=chk,
+        )
+
+    with And("external ClickHouse client container is started"):
+        start_external_ch_container(
+            cipher_suites=external_client_cipher_suites,
+        )
+
+    with And("FIPS Keeper is deployed"):
+        fips_apply_manifest(
+            manifest_path=chk_manifest,
+            expected_pod_count=2,
+            kind="chk",
+        )
+
+    with And("FIPS ClickHouse is deployed"):
+        fips_apply_manifest(
+            manifest_path=chi_manifest,
+            expected_pod_count=2,
+            kind="chi",
+            apply_templates=[backup_template],
+        )
+
+    with Then("initial CHI passes FIPS checks"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=2,
+            kind="chi",
+        )
+
+        fips_check_replication_across_replicas(
+            chi_pods=chi_pods,
+            table="repl_before_update",
+        )
+
+    for cipher_suite_case in cipher_suite_cases:
+        allowed_cipher_suite = cipher_suite_case["allowed"]
+
+        with Check(f"only {allowed_cipher_suite} is accepted after TLS config update"):
+            with When("CHK TLS cipher suite configuration is updated"):
+                updated_chk_manifest = fips_edit_cipher_suites_manifest(
+                    source_manifest=chk_manifest,
+                    cipher_suites=(allowed_cipher_suite,),
+                )
+
+                fips_apply_manifest(
+                    manifest_path=updated_chk_manifest,
+                    expected_pod_count=2,
+                    kind="chk",
+                )
+
+            with And("CHI TLS cipher suite configuration is updated"):
+                updated_chi_manifest = fips_edit_cipher_suites_manifest(
+                    source_manifest=chi_manifest,
+                    cipher_suites=(allowed_cipher_suite,),
+                )
+
+                fips_apply_manifest(
+                    manifest_path=updated_chi_manifest,
+                    expected_pod_count=2,
+                    kind="chi",
+                    apply_templates=[backup_template],
+                )
+
+            with Then("updated CHK still passes FIPS checks"):
+                fips_assert_replicas_healthy(
+                    workload=chk,
+                    expected_count=2,
+                    kind="chk",
+                )
+
+            with And("updated CHI still passes FIPS checks"):
+                chi_pods = fips_assert_replicas_healthy(
+                    workload=chi,
+                    expected_count=2,
+                    kind="chi",
+                )
+
+                fips_check_replication_across_replicas(
+                    chi_pods=chi_pods,
+                    table=f"repl_after_update_{allowed_cipher_suite.lower()}",
+                )
+
+            with And("generated CHI OpenSSL config contains the configured cipher suite"):
+                fips_assert_chi_cipher_suites_configured(
+                    pod=chi_pods[0],
+                    cipher_suites=(allowed_cipher_suite,),
+                )
+
+            with And("configured TLS cipher suite is negotiated by ClickHouse"):
+                fips_assert_clickhouse_https_cipher_suite_accepted(
+                    pod=chi_pods[0],
+                    cipher_suite=allowed_cipher_suite,
+                )
+
+            for rejected_cipher_suite in external_client_cipher_suites:
+                if rejected_cipher_suite == allowed_cipher_suite:
+                    continue
+
+                with And(f"non-configured TLS cipher suite {rejected_cipher_suite} is rejected by ClickHouse"):
+                    fips_assert_clickhouse_https_cipher_suite_rejected(
+                        pod=chi_pods[0],
+                        cipher_suite=rejected_cipher_suite,
+                    )
     with Finally("external ClickHouse client container is removed"):
         stop_external_ch_container()
 

@@ -108,7 +108,6 @@ PRELOAD_IMAGES_METRICS=(
     "clickhouse/clickhouse-server:25.3"
     "clickhouse/clickhouse-server:latest"
     "altinity/clickhouse-server:25.8.16.10001.altinitystable"  # default clickhouse_template
-    "docker.io/zookeeper:3.8.4"                                # metrics_alerts exec's into zookeeper-0 pod
 )
 
 # =============================================================================

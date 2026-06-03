@@ -23,3 +23,7 @@ spec:
           containers:
             - name: clickhouse
               image: altinity/clickhouse-server:25.8.16.10002.altinityfips-decoy
+              # Synthetic local-only alias (exists on no registry). The test loads
+              # it into minikube via `minikube image load`; Never stops the kubelet
+              # from attempting a registry pull (which would ImagePullBackOff).
+              imagePullPolicy: Never

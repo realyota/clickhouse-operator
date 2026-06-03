@@ -8648,6 +8648,68 @@ def test_030010(self):
         )
         util.restart_operator()
 
+@TestScenario
+@Name("test_030012. FIPS backup: ClickHouse over TLS and HTTPS restore round-trip")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_ClickHouseOverTLS("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_RestoreRoundTrip("1.0"),
+)
+@Tags("NO_PARALLEL")
+def test_030012(self):
+    """Verify clickhouse-backup uses TLS to ClickHouse and restore works via HTTPS API."""
+
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
+    chi_manifest = "manifests/chi/test-030003.yaml"
+    chk_manifest = "manifests/chk/test-030003.yaml"
+    backup_template = "manifests/chit/test-030003-backup-template.yaml"
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with Given("strict FIPS operator configuration is applied"):
+        util.apply_operator_config(chopconf)
+
+    with And("test TLS secret is installed"):
+        create_tls_secret_for_fips_hosts(chi=chi, chk=chk)
+
+    with And("external ClickHouse client container is started"):
+        start_external_ch_container()
+
+    with And("FIPS Keeper is deployed"):
+        fips_apply_manifest(
+            manifest_path=chk_manifest,
+            expected_pod_count=2,
+            kind="chk",
+        )
+
+    with And("FIPS ClickHouse with backup sidecar is deployed"):
+        fips_apply_manifest(
+            manifest_path=chi_manifest,
+            expected_pod_count=2,
+            kind="chi",
+            apply_templates=[backup_template],
+        )
+
+    with Given("FIPS ClickHouse cluster is healthy"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=2,
+            kind="chi",
+        )
+
+        pod = chi_pods[0]
+
+    with Then("backup sidecar reaches ClickHouse through secure native TCP"):
+        check_clickhouse_backup_clickhouse_tls_config(pod=pod)
+        check_clickhouse_backup_can_list_tables_over_clickhouse_tls(pod=pod)
+
+    with Then("backup and restore succeeds through HTTPS API"):
+        check_clickhouse_backup_restore_roundtrip_https(pod=pod)
+
+    with Finally("external ClickHouse client container is removed"):
+        stop_external_ch_container()
 
 def cleanup_chis(self):
     with Given("Cleanup CHIs"):

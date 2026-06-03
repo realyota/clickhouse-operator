@@ -84,7 +84,20 @@ spec:
 
 Both cluster manifests run ClickHouse on secure ports only. Plain-text ports
 are removed and replaced by TLS equivalents; the cluster trusts the shared CA
-through `rootCASecretRef`.
+through `rootCASecretRef`. See
+[`25-fips-02-cluster.yaml`](chi-examples/25-fips-02-cluster.yaml) and [`25-fips-03-cluster-with-backup.yaml`](chi-examples/25-fips-03-cluster-with-backup.yaml).
+
+The CHI cluster uses `secure: "yes"` with `insecure: "no"`. These settings enable secure ClickHouse network interfaces 
+and service ports. In CHI, they do not automatically remove all plain-text ClickHouse interfaces; TLS-only deployments 
+should explicitly configure the desired secure ports and disable any unused plain-text ports.
+
+```yaml
+clusters:
+  - name: default
+    secure: "yes"
+    insecure: "no"
+```
+
 
 ```yaml
 settings:

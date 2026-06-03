@@ -7532,8 +7532,11 @@ def test_020014(self):
     suppress every plaintext client surface while preserving the secure
     ones: the per-cluster Service drops zk:2181 entirely; STS container
     ports drop the plaintext zk entry; the per-host overlay
-    chop-generated-listeners.xml emits <tcp_port remove="1"/> alongside
-    <tcp_port_secure>2281</tcp_port_secure> so the Keeper process binds
+    chop-generated-listeners.xml (conf.d) emits <tcp_port_secure>2281</tcp_port_secure>
+    while the common overlay chop-generated-common-listeners.xml
+    (keeper_config.d) emits <tcp_port remove="1"/> — the removal must sit in
+    the common dir alongside the static <tcp_port> it deletes, since Keeper
+    merges keeper_config.d after conf.d — so the Keeper process binds
     no plaintext listener at all; and the liveness probe falls back to
     `pgrep` because upstream Keeper does not serve 4LW over TLS. Raft
     inter-peer TLS is still wired (<secure>1</secure> per <server>).
@@ -7579,18 +7582,32 @@ def test_020014(self):
         )
         assert "zk-secure" in cports, error(f"expected zk-secure container port, got {cports}")
 
-    with And("Per-host ConfigMap listeners XML suppresses tcp_port and emits tcp_port_secure"):
+    with And("Per-host ConfigMap (conf.d) listeners XML opens tcp_port_secure, no plaintext removal"):
         cm = kubectl.get("configmap", f"chk-{chk}-deploy-confd-{cluster}-{host}")
         data = cm.get("data", {})
         assert "chop-generated-listeners.xml" in data, error(
             f"chop-generated-listeners.xml missing; ConfigMap keys: {list(data.keys())}"
         )
         xml = data["chop-generated-listeners.xml"]
-        assert '<tcp_port remove="1"/>' in xml, error(
-            f"expected <tcp_port remove=\"1\"/> suppression in listeners xml:\n{xml}"
-        )
         assert "<tcp_port_secure>2281</tcp_port_secure>" in xml, error(
-            f"expected <tcp_port_secure>2281</tcp_port_secure> in listeners xml:\n{xml}"
+            f"expected <tcp_port_secure>2281</tcp_port_secure> in per-host listeners xml:\n{xml}"
+        )
+        # The plaintext removal must NOT be in the per-host conf.d overlay: a
+        # remove="1" placed in conf.d cannot delete the static <tcp_port> shipped
+        # in keeper_config.d (Keeper merges keeper_config.d after conf.d).
+        assert '<tcp_port remove="1"/>' not in xml, error(
+            f"plaintext removal must NOT live in the per-host conf.d overlay; got:\n{xml}"
+        )
+
+    with And("Common ConfigMap (keeper_config.d) removes the static plaintext tcp_port"):
+        cm = kubectl.get("configmap", f"chk-{chk}-common-configd")
+        data = cm.get("data", {})
+        assert "chop-generated-common-listeners.xml" in data, error(
+            f"chop-generated-common-listeners.xml missing; ConfigMap keys: {list(data.keys())}"
+        )
+        xml = data["chop-generated-common-listeners.xml"]
+        assert '<tcp_port remove="1"/>' in xml, error(
+            f"expected <tcp_port remove=\"1\"/> suppression in common listeners xml:\n{xml}"
         )
 
     with And("Liveness probe falls back to pgrep (4LW unavailable over TLS)"):
@@ -7702,6 +7719,14 @@ def test_020016(self):
         assert "chop-generated-listeners.xml" not in data, error(
             "chop-generated-listeners.xml must be absent when both cluster.secure and "
             f"cluster.insecure are unset; ConfigMap keys: {list(data.keys())}"
+        )
+
+    with And("Common ConfigMap omits chop-generated-common-listeners.xml (byte-identity for non-adopters)"):
+        cm = kubectl.get("configmap", f"chk-{chk}-common-configd")
+        data = cm.get("data", {})
+        assert "chop-generated-common-listeners.xml" not in data, error(
+            "chop-generated-common-listeners.xml (plaintext-port removal) must be absent for a "
+            f"legacy CHK; ConfigMap keys: {list(data.keys())}"
         )
 
     with And("Liveness probe uses bash /dev/tcp ruok (NOT pgrep fallback)"):

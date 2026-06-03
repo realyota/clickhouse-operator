@@ -69,6 +69,19 @@ def restart_operator(ns=None, timeout=600, shell=None):
     pod = kubectl.get("pod", name="", ns=ns, label=operator_label, shell=shell)["items"][0]
     new_pod_name = pod["metadata"]["name"]
     kubectl.wait_pod_status(new_pod_name, "Running", ns=ns, shell=shell)
+    # Running != Ready != reconciling. Wait for the Deployment to report the
+    # replacement pod fully rolled out (Ready) so the operator's informers have
+    # synced and it is actually reconciling before the caller applies any CR.
+    # Without this, a CR applied during the post-Running/pre-sync window has its
+    # create event missed and never gets a .status written -- the test_030008
+    # soak flake where test-074-non-fips sat at .status.status=<none> for the
+    # entire retry budget and never recovered.
+    kubectl.launch(
+        "rollout status deployment.v1.apps/clickhouse-operator",
+        ns=ns,
+        timeout=timeout,
+        shell=shell,
+    )
     pod = kubectl.get("pod", name="", ns=ns, label=operator_label, shell=shell)["items"][0]
     new_pod_ip = pod["status"]["podIP"]
     print(f"old operator pod: {old_pod_name} ip: {old_pod_ip}")

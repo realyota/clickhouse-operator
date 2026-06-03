@@ -267,5 +267,18 @@ def test(self):
         # baseline in its finally block.
         test_metrics_exporter_chopconf_restart,
     ]
-    for t in test_cases:
-        Scenario(test=t)()
+    try:
+        for t in test_cases:
+            Scenario(test=t)()
+    finally:
+        # Tear down the fixed `test` namespace (operator + any leftover CHIs)
+        # on the way out. The scenarios here use a SHARED fixed namespace with
+        # no per-test Finally, so without this the namespace + installed
+        # operator leak after the suite finishes (clean_namespace above only
+        # clears the PREVIOUS run's residue at start). Runs on success and
+        # failure; honored NO_CLEANUP keeps the namespace for debugging.
+        with Finally("Delete the test namespace"):
+            if settings.no_cleanup:
+                print(f"NO_CLEANUP is set, skipping namespace deletion: {self.context.test_namespace}")
+            else:
+                util.delete_namespace(namespace=self.context.test_namespace, delete_chi=True)

@@ -1501,6 +1501,7 @@ def wait_for_cluster(chi, cluster, num_shards, num_replicas=0, pwd="", force_wai
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010014_0. Test that schema is correctly propagated on replicas")
 @Requirements(
     RQ_SRS_026_ClickHouseOperator_CustomResource_Spec_Configuration_Clusters_Cluster_ZooKeeper("1.0"),
@@ -3753,6 +3754,7 @@ def test_010033(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010035. Auto-recovery from aborted reconcile when pod becomes Ready")
 def test_010035(self):
     """Verify that when a CHI reconcile is aborted because a pod did not become
@@ -3812,6 +3814,7 @@ def test_010035(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010035_1. Opt-out: CHI stays Aborted when auto-recovery onPodReady=none")
 def test_010035_1(self):
     """Opt-out path: Verify that when the operator is configured with
@@ -4633,6 +4636,7 @@ def test_010041(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010042. Test configuration rollback")
 def test_010042(self):
     create_shell_namespace_clickhouse_template()
@@ -4881,6 +4885,7 @@ def test_010043_1(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Requirements(RQ_SRS_026_ClickHouseOperator_ReconcilingCycle("1.0"),
               RQ_SRS_026_ClickHouseOperator_Managing_ClusterScaling_SchemaPropagation("1.0"))
 @Name("test_010044. Schema and data propagation with slow replica")
@@ -4994,6 +4999,7 @@ def test_010045_1(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Requirements(RQ_SRS_026_ClickHouseOperator_Configuration_Spec_ReconcileWaitQueries("1.0"))
 @Name("test_010045_2. Reconcile wait queries property specified by clickhouse-operator config")
 def test_010045_2(self):
@@ -5009,6 +5015,7 @@ def test_010045_2(self):
 
 @TestScenario
 @Name("test_010046. Metrics for clickhouse-operator")
+@Tags("HEAVY")
 def test_010046(self):
     """Check that clickhouse-operator creates metrics for reconcile and other clickhouse-operator events."""
     create_shell_namespace_clickhouse_template()
@@ -5489,6 +5496,7 @@ def test_010054(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010055. Test that restart rules can be merged from CHOP configuration")
 def test_010055(self):
     create_shell_namespace_clickhouse_template()
@@ -5700,6 +5708,7 @@ def test_010057(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010058. Check ClickHouse with rootCA")
 def test_010058(self):  # Can be merged with test_034 potentially
     create_shell_namespace_clickhouse_template()
@@ -5938,6 +5947,7 @@ def check_operator_logs(markers, since = ""):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010062. Reconcile hooks")
 @Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
 def test_010062(self):
@@ -6231,6 +6241,7 @@ def test_010063(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010064. Test CHK watch triggers CHI reconcile on keeper resource update")
 @Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
 def test_010064(self):
@@ -6377,6 +6388,7 @@ def test_010065_0(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010065. FIPS IPC Secure mode: operator↔exporter token-protected channel")
 @Requirements(
     RQ_SRS_026_ClickHouseOperator_FIPS_Connect_Operator_IPCSecure("1.0")
@@ -6553,6 +6565,7 @@ def test_010066(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010067. 3-level security inheritance: chopconf → CHI → cluster precedence")
 @Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
 def test_010067(self):
@@ -6831,6 +6844,7 @@ def test_010070(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010071. IPC Secure mode: operator-pod restart preserves token + exporter waitForToken tolerates race")
 @Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
 def test_010071(self):
@@ -6906,6 +6920,7 @@ def test_010071(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010072. IPC Secure mode: /metrics remains accessible from another pod")
 @Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
 def test_010072(self):
@@ -7272,6 +7287,7 @@ def test_020003_2(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_020005. Clickhouse-keeper scale-up/scale-down")
 def test_020005(self):
     """Check that clickhouse-operator support scale-up/scale-down without service interruption"""
@@ -7745,6 +7761,7 @@ def test_020016(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_030001. FIPS build: shipped image binaries embed GOFIPS140=v1.0.0")
 @Requirements(
     RQ_SRS_026_ClickHouseOperator_FIPS_Build_ShippedBinaries("1.0")
@@ -7772,7 +7789,10 @@ def test_030001(self):
 
     gofips_version = "v1.0.0"
     gofips140_needle = f"GOFIPS140={gofips_version}"
-    operator_version = self.context.operator_version
+    # --fips-info reports the build-baked release version (ldflags from the
+    # `release` file), NOT the image tag — so compare against release_version,
+    # which holds the release-file value even when OPERATOR_VERSION=dev.
+    release_version = self.context.release_version
     godebug_default = "fips140=on"
 
     with Given("operator and metrics-exporter binaries are extracted from shipped images"):
@@ -7788,7 +7808,7 @@ def test_030001(self):
         check_fips_runtime_modes(
             binary_path=op_bin,
             binary="clickhouse-operator",
-            version=operator_version,
+            version=release_version,
             gofips_version=gofips_version,
             godebug_default=godebug_default,
         )
@@ -7800,17 +7820,17 @@ def test_030001(self):
         check_fips_runtime_modes(
             binary_path=me_bin,
             binary="metrics-exporter",
-            version=operator_version,
+            version=release_version,
             gofips_version=gofips_version,
             godebug_default=godebug_default,
         )
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_030002. FIPS build: startup banners with strict chopconf and GODEBUG")
 @Requirements(
     RQ_SRS_026_ClickHouseOperator_FIPS_Build_ShippedBinaries_StartupLogs("1.0")
 )
-@Tags("NO_PARALLEL")
 def test_030002(self):
     """Verify FIPS startup banners from running operator and exporter binaries."""
     chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
@@ -7839,6 +7859,7 @@ def test_030002(self):
         fips_startup_banner_ok(container="metrics-exporter", logs=me_logs)
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_030003. FIPS CHI/CHK: TLS-only ports and replicated CH traffic")
 @Requirements(
     RQ_SRS_026_ClickHouseOperator_FIPS_Connect_Operator_Listeners("1.0"),
@@ -7859,7 +7880,6 @@ def test_030002(self):
     RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_OnlyTLSPorts("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_HTTPSAPI("1.0"),
 )
-@Tags("NO_PARALLEL")
 def test_030003(self):
     """Verify a FIPS ClickHouse + Keeper deployment runs with TLS-only data paths:
     FIPS-built ClickHouse, Keeper, and clickhouse-backup binaries; only secure
@@ -7961,12 +7981,12 @@ def test_030003(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_030004. FIPS CHI: scale replicas 2 -> 3 -> 1")
 @Requirements(
     RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_ScaleUp("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_ScaleDown("1.0"),
 )
-@Tags("NO_PARALLEL")
 def test_030004(self):
     """Verify FIPS ClickHouse survives replica scale-up and scale-down.
 
@@ -8072,12 +8092,12 @@ def test_030004(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_030005. FIPS CHK: scale replicas 2 -> 3 -> 1")
 @Requirements(
     RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHK_ScaleUp("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHK_ScaleDown("1.0"),
 )
-@Tags("NO_PARALLEL")
 def test_030005(self):
     """Verify FIPS ClickHouse Keeper survives replica scale-up and scale-down.
 
@@ -8215,6 +8235,7 @@ def test_030005(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_030006. FIPS enforced: coerces verify, minVersion, and IPC")
 @Requirements(
     RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_CoerceVerifyStrict("1.0"),
@@ -8222,7 +8243,6 @@ def test_030005(self):
     RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_OverrideMinVersion12To13("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_CoerceIPCSecure("1.0"),
 )
-@Tags("NO_PARALLEL")
 def test_030006(self):
     """Verify ``fips.enforced=true`` coerces relaxed chopconf TLS verify, minVersion, and IPC."""
     chopconf = (
@@ -8248,6 +8268,7 @@ def test_030006(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_030007. FIPS enforced: invalid CHI/CHK specs are rejected")
 @Requirements(
     RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_RejectVerifyNoneCHI("1.0"),
@@ -8256,7 +8277,6 @@ def test_030006(self):
     RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_RejectExternalZookeeper("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_RejectCHKBypass("1.0"),
 )
-@Tags("NO_PARALLEL")
 def test_030007(self):
     """Verify strict FIPS mode rejects non-compliant CHI and CHK specifications."""
     chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
@@ -8372,6 +8392,7 @@ def test_030007(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_030008. FIPS image policy Required: admission and runtime checks")
 @Requirements(
     RQ_SRS_026_ClickHouseOperator_FIPS_Images_Required_RejectCHI("1.0"),
@@ -8385,7 +8406,6 @@ def test_030007(self):
     RQ_SRS_026_ClickHouseOperator_FIPS_Images_TagDetection_DigestOnly("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_Images_TagDetection_RegistryPath("1.0"),
 )
-@Tags("NO_PARALLEL")
 def test_030008(self):
     """Verify ``security.images.policy=FIPSRequired`` rejects non-fips images
     and accepts images whose tags contain ``fips`` (case-insensitive).
@@ -8539,13 +8559,30 @@ def test_030008(self):
             text=True,
             check=False,
         )
+        # The kubelet uses minikube's own image store, not the host docker
+        # daemon where `docker tag` created the alias — load it in, otherwise the
+        # decoy pod is ImagePullBackOff (the synthetic tag exists on no registry)
+        # and never starts, so the runtime SELECT version() check never runs.
+        load_result = None
+        if tag_result.returncode == 0:
+            load_result = subprocess.run(
+                ["minikube", "image", "load", decoy_tag],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
         if tag_result.returncode != 0:
             note(
                 f"skipping runtime decoy check: "
                 f"docker tag failed ({tag_result.stderr.strip()})"
             )
+        elif load_result.returncode != 0:
+            note(
+                f"skipping runtime decoy check: "
+                f"minikube image load failed ({load_result.stderr.strip()})"
+            )
         else:
-            with And("CHI with fips tag but non-fips binary is applied"):
+            with When("CHI with fips tag but non-fips binary is applied"):
                 fips_apply_manifest_raw(manifest_path=chi_runtime_decoy_manifest)
 
             with Then("CHI is aborted at runtime with FIPSImagePolicyViolation"):
@@ -8556,12 +8593,12 @@ def test_030008(self):
                 )
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_030009. FIPS enforced: operator TLS clients reject servers without TLS 1.3")
 @Requirements(
     RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_CoerceMinVersion13("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_MinVersionScope("1.0"),
 )
-@Tags("NO_PARALLEL")
 def test_030009(self):
     """Verify operator-side TLS clients reject servers without TLS 1.3.
 
@@ -8629,8 +8666,8 @@ def test_030009(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_030010. FIPS on-wire TLS verification: Strict + wrong rootCA fails ClickHouse fetch")
-@Tags("NO_PARALLEL")
 def test_030010(self):
     """Strict verify with a wrong rootCA must fail operator ClickHouse fetch."""
     tls_secret = "manifests/secret/test-058-secret.yaml"
@@ -8674,12 +8711,12 @@ def test_030010(self):
         util.restart_operator()
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_030012. FIPS backup: ClickHouse over TLS and HTTPS restore round-trip")
 @Requirements(
     RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_ClickHouseOverTLS("1.0"),
     RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_RestoreRoundTrip("1.0"),
 )
-@Tags("NO_PARALLEL")
 def test_030012(self):
     """Verify clickhouse-backup uses TLS to ClickHouse and restore works via HTTPS API."""
 
@@ -8773,11 +8810,27 @@ def test(self):
     # define values for Operator upgrade test (test_009)
 
     with Pool(int(os.environ.get("POOL_SIZE", 3))) as pool:
-        for scenario in loads(current_module(), Scenario, Suite):
-            if not (hasattr(scenario, "tags") and ("NO_PARALLEL" in scenario.tags)):
-                Scenario(run=scenario, parallel=True, executor=pool)
+        # Front-load HEAVY scenarios (chopconf->operator restart, scaling,
+        # multi-deploy). sorted() is stable, so the key (0 for HEAVY, else 1)
+        # moves heavy tests to the front while preserving the natural per-group
+        # (0100xx/0200xx/0300xx) source order within each bucket — slow tests
+        # start early AND lead within each group, grabbing pool workers instead
+        # of trickling in at the tail (where retries serialize). Order-only:
+        # membership and the NO_PARALLEL exclusion are unaffected.
+        parallel_scenarios = [
+            scenario
+            for scenario in loads(current_module(), Scenario, Suite)
+            if not (hasattr(scenario, "tags") and ("NO_PARALLEL" in scenario.tags))
+        ]
+        parallel_scenarios.sort(
+            key=lambda s: 0 if (hasattr(s, "tags") and ("HEAVY" in s.tags)) else 1
+        )
+        for scenario in parallel_scenarios:
+            Scenario(run=scenario, parallel=True, executor=pool)
         join()
 
+    # Sequential pass: intentionally NOT reordered — test_090099 (CRD deletion)
+    # must run last, after test_010036 / the upgrade tests.
     for scenario in loads(current_module(), Scenario, Suite):
         if hasattr(scenario, "tags") and ("NO_PARALLEL" in scenario.tags):
             Scenario(run=scenario)

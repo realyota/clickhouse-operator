@@ -98,6 +98,13 @@ def set_settings(self):
         if "OPERATOR_VERSION" in os.environ
         else open(os.path.join(pathlib.Path(__file__).parent.absolute(), "../../release")).read(1024).strip(" \r\n\t")
     ))
+    # release_version is the version baked into the binaries at build time
+    # (dev/go_build_universal.sh ldflags -X pkg/version.Version from the `release`
+    # file), which is what `--fips-info` reports. It is intentionally NOT the
+    # OPERATOR_VERSION env / image tag (which can be "dev"): the tag is a
+    # deploy-time label, the baked version is a build-time fact. Read the same
+    # `release` file the build reads so the two always track on a release bump.
+    self.context.release_version = define("release_version", open(os.path.join(pathlib.Path(__file__).parent.absolute(), "../../release")).read(1024).strip(" \r\n\t"))
     self.context.operator_namespace = define("operator_namespace", os.getenv("OPERATOR_NAMESPACE") if "OPERATOR_NAMESPACE" in os.environ else self.context.test_namespace)
     self.context.operator_install = define("operator_install", os.getenv("OPERATOR_INSTALL") if "OPERATOR_INSTALL" in os.environ else "yes")
     self.context.minio_namespace = define("minio_namespace", os.getenv("MINIO_NAMESPACE") if "MINIO_NAMESPACE" in os.environ else "minio")

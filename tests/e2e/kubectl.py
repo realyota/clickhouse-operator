@@ -16,6 +16,31 @@ import e2e.util as util
 current_dir = os.path.dirname(os.path.abspath(__file__))
 max_retries = 20
 
+# A transient kube-apiserver/network outage (operator restart, etcd hiccup, brief
+# network loss, a minikube control-plane bounce) makes kubectl exit non-zero with
+# one of these connectivity signatures rather than a real command result. Matched
+# case-insensitively (values are lowercase) against the merged stdout+stderr stream.
+# Deliberately conservative: only client-side transport/discovery phrases that can
+# never be a legitimate command outcome -- NOT NotFound/AlreadyExists/Invalid/
+# Forbidden, which are deterministic results that must keep failing fast.
+_TRANSIENT_APISERVER_ERRORS = (
+    "no route to host",
+    "connection refused",
+    "unexpected eof",
+    "couldn't get current server api group list",
+    "the connection to the server",  # e.g. "...localhost:8080 was refused"
+    "was refused - did you specify the right host",
+    "unable to connect to the server",
+    "i/o timeout",
+    "tls handshake timeout",
+    "etcdserver: request timed out",
+    "etcdserver: leader changed",
+    "the server is currently unable to handle the request",
+    "transport is closing",
+)
+# Bounded retry budget for transient kube-apiserver errors (see run_shell).
+_transient_max_retries = 5
+
 
 def launch(command, ok_to_fail=False, ns=None, timeout=600, shell=None):
     # Build commanddef launch
@@ -40,27 +65,50 @@ def launch(command, ok_to_fail=False, ns=None, timeout=600, shell=None):
     # command = cmd
     # print(f"run command: {cmd}")
 
-    return run_shell(cmd, timeout, ok_to_fail, shell=shell)
+    # retry_transient: kubectl-only resilience (launch builds a kubectl command),
+    # so a momentary apiserver blip is retried rather than hard-failing the test.
+    # Direct run_shell() callers (docker, `go version -m`) keep fail-fast.
+    return run_shell(cmd, timeout, ok_to_fail, shell=shell, retry_transient=True)
 
 
-def run_shell(cmd, timeout=600, ok_to_fail=False, shell=None):
+def run_shell(cmd, timeout=600, ok_to_fail=False, shell=None, retry_transient=False):
     # Run command
 
-    if shell is None:
-        res_cmd = current().context.shell(cmd, timeout=timeout)
-    else:
-        res_cmd = shell(cmd, timeout=timeout)
+    attempt = 0
+    while True:
+        if shell is None:
+            res_cmd = current().context.shell(cmd, timeout=timeout)
+        else:
+            res_cmd = shell(cmd, timeout=timeout)
 
-    # Check command failure
-    code = res_cmd.exitcode
-    if not ok_to_fail:
-        if code != 0:
-            print(f"command failed, command:\n{cmd}")
-            print(f"command failed, exit code:\n{code}")
-            print(f"command failed, output :\n{res_cmd.output}")
+        # Check command failure
+        code = res_cmd.exitcode
+        if code == 0 or ok_to_fail:
+            # Command test result
+            return res_cmd.output if (code == 0) or ok_to_fail else ""
+
+        # code != 0 and ok_to_fail is False. Retry ONLY a transient kube-apiserver
+        # connectivity blip (retry_transient is set by launch() for kubectl calls),
+        # bounded. A genuine failure (NotFound, validation, ...) matches nothing here
+        # and falls straight through to the original print+assert, unchanged.
+        output = res_cmd.output or ""
+        if (
+            retry_transient
+            and attempt < _transient_max_retries
+            and any(sig in output.lower() for sig in _TRANSIENT_APISERVER_ERRORS)
+        ):
+            attempt += 1
+            retry_sleep(
+                attempt,
+                5,
+                reason=f"Transient kube-apiserver error (attempt {attempt}/{_transient_max_retries})",
+            )
+            continue
+
+        print(f"command failed, command:\n{cmd}")
+        print(f"command failed, exit code:\n{code}")
+        print(f"command failed, output :\n{output}")
         assert code == 0, error()
-    # Command test result
-    return res_cmd.output if (code == 0) or ok_to_fail else ""
 
 
 def delete_kind(kind, name, ns=None, ok_to_fail=False, shell=None):
@@ -72,6 +120,20 @@ def delete_kind(kind, name, ns=None, ok_to_fail=False, shell=None):
             ok_to_fail=ok_to_fail,
             shell=shell
         )
+
+
+def force_clear_finalizers(kind, name, ns=None, shell=None):
+    """Remove a stuck CR's finalizers so the apiserver can reap it.
+
+    Used when the operator was killed or is mid-restart (e.g. chopconf
+    onChange=restart) and never removed the finalizer. Logs a WARNING so a
+    genuine operator-cleanup bug stays visible rather than being silently masked.
+    """
+    print(f"WARNING: {kind}/{name} still present; force-clearing finalizers (operator may be killed/restarting)")
+    launch(
+        f"patch {kind} {name} --type=merge -p '{{\"metadata\":{{\"finalizers\":null}}}}'",
+        ns=ns, ok_to_fail=True, shell=shell,
+    )
 
 
 def delete_chi(chi, ns=None, wait=True, ok_undeleted = False, ok_to_fail=False, shell=None):
@@ -120,13 +182,8 @@ def delete_chk(chk, ns=None, wait=True, ok_to_fail=False, shell=None):
         # namespace is mid-tear-down), the CHK CR stays stuck with finalizer.
         # Force-clear so namespace deletion can proceed instead of hanging the
         # whole suite on a downstream timeout.
-        still_there = get_count("chk", name=chk, ns=ns, shell=shell)
-        if still_there:
-            print(f"WARNING: chk/{chk} still present after wait --for=delete; clearing finalizers")
-            launch(
-                f"patch chk {chk} --type=merge -p '{{\"metadata\":{{\"finalizers\":[]}}}}'",
-                ns=target_ns, ok_to_fail=True, shell=shell,
-            )
+        if get_count("chk", name=chk, ns=ns, shell=shell):
+            force_clear_finalizers("chk", chk, ns=target_ns, shell=shell)
 
         # def wait_object(kind, name, names=[], label="", count=1, ns=None, retries=max_retries, backoff=5, shell=None):
         wait_object("chk", chk, count=0, ns=ns, shell=shell)
@@ -172,24 +229,29 @@ def delete_all(kind, ns=None):
         if "items" in to_delete:
             for i in to_delete["items"]:
                 name = i["metadata"]["name"]
-                try:
-                    delete_kind(kind, name, ns=ns)
-                except Exception:
-                    # Stuck finalizer fallback: when the operator was killed
-                    # mid-reconcile (between test retries, after `pkill
-                    # regression.py`), the CR is left with an unreleased
-                    # finalizer. kubectl delete --timeout=600s exhausts and
-                    # raises. Force-clear the finalizer and re-attempt — this
-                    # masks operator-side cleanup bugs but unblocks subsequent
-                    # test runs after mid-reconcile aborts.
-                    with When(f"Force-clear stuck finalizer on {kind}/{name}"):
-                        launch(
-                            f"patch {kind} {name} --type=merge "
-                            f"-p '{{\"metadata\":{{\"finalizers\":null}}}}'",
-                            ns=ns,
-                            ok_to_fail=True,
-                        )
+                # Initial delete. ok_to_fail: a stuck finalizer (operator killed
+                # OR mid-restart — e.g. chopconf onChange=restart in test_030008)
+                # makes `kubectl delete --timeout` exit non-zero; we recover via
+                # the force-clear loop below, so this must not raise here.
+                delete_kind(kind, name, ns=ns, ok_to_fail=True)
+                # Stuck/re-attached finalizer recovery. The operator can RE-ATTACH
+                # a finalizer after a clear while it is restarting, so a single
+                # wait_object would race the restart and raise. Re-clear + re-delete
+                # up to max_retries until the CR is actually reaped. We WARN on each
+                # pass so a genuine operator-cleanup bug stays visible in the logs
+                # instead of being silently masked.
+                for attempt in range(1, max_retries):
+                    if get_count(kind, name=name, ns=ns) == 0:
+                        break
+                    force_clear_finalizers(kind, name, ns=ns)
                     delete_kind(kind, name, ns=ns, ok_to_fail=True)
+                    # Only sleep if another re-check follows; skip on the last
+                    # attempt so a genuinely-stuck CR hits the final wait_object
+                    # (the authoritative leak assertion) without an extra wait.
+                    if attempt < max_retries - 1:
+                        retry_sleep(attempt, 5, f"{kind}/{name} still terminating")
+                # Final assertion: if the CR survived every force-clear, this
+                # raises — surfacing a real cleanup leak rather than hiding it.
                 wait_object(kind, name, ns=ns, count=0)
 
 

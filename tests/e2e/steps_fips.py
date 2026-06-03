@@ -116,11 +116,16 @@ def check_fips_info_values(
     binary_path,
     godebug_runtime=None,
     binary="clickhouse-operator",
-    version="0.27.1",
+    version=None,
     gofips_version="v1.0.0",
     godebug_default="fips140=on",
 ):
     """Check parsed --fips-info output."""
+    # The --fips-info "version" is the build-baked release version, not the
+    # image tag. Default to the release-file value resolved in set_settings so
+    # this never compares against a stale hardcode or the OPERATOR_VERSION tag.
+    if version is None:
+        version = self.context.release_version
     env = {}
     if godebug_runtime is not None:
         env["GODEBUG"] = "" if godebug_runtime == "" else f"fips140={godebug_runtime}"
@@ -273,13 +278,16 @@ def fips_apply_operator_godebug(self):
 
     ns = current().context.operator_namespace
     expected = f"fips140={mode}"
-    for container in ("clickhouse-operator", "metrics-exporter"):
-        kubectl.launch(
-            "set env deployment/clickhouse-operator "
-            f"-c {container} "
-            f"--overwrite GODEBUG={expected}",
-            ns=ns,
-        )
+    # One patch for both containers (kubectl set env defaults to --containers='*',
+    # and the operator Deployment has exactly clickhouse-operator + metrics-exporter).
+    # Two separate per-container edits produced two ReplicaSet revisions racing each
+    # other, so `rollout status` could latch onto an intermediate revision while the
+    # final pod was still cache-syncing -- one of the test_030008 restart-storm races.
+    kubectl.launch(
+        "set env deployment/clickhouse-operator "
+        f"--overwrite GODEBUG={expected}",
+        ns=ns,
+    )
     kubectl.launch(
         "rollout status deployment/clickhouse-operator",
         ns=ns,

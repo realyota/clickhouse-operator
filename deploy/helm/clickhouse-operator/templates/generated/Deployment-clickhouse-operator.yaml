@@ -2,9 +2,9 @@
 #
 # NAMESPACE=kube-system
 # COMMENT=
-# OPERATOR_IMAGE=altinity/clickhouse-operator:0.27.0
+# OPERATOR_IMAGE=altinity/clickhouse-operator:0.27.1
 # OPERATOR_IMAGE_PULL_POLICY=Always
-# METRICS_EXPORTER_IMAGE=altinity/metrics-exporter:0.27.0
+# METRICS_EXPORTER_IMAGE=altinity/metrics-exporter:0.27.1
 # METRICS_EXPORTER_IMAGE_PULL_POLICY=Always
 #
 # Setup Deployment for clickhouse-operator
@@ -64,6 +64,14 @@ spec:
         - name: etc-keeper-operator-usersd-folder
           configMap:
             name: {{ include "altinity-clickhouse-operator.fullname" . }}-keeper-usersd-files
+        # IPC token volume shared between operator and metrics-exporter containers.
+        # Pod-local emptyDir (never persisted, never visible via kubectl get secret).
+        # Operator writes a random per-Pod token here at startup; exporter reads it
+        # for the X-CHOP-Token header check. Only used when clickhouse.security.ipc.mode=Secure.
+        - name: clickhouse-operator-ipc
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
       containers:
         - name: {{ .Chart.Name }}
           image: {{ if .Values.operator.image.registry }}{{ .Values.operator.image.registry | trimSuffix "/" }}/{{ end }}{{ .Values.operator.image.repository }}:{{ include "altinity-clickhouse-operator.operator.tag" . }}
@@ -87,6 +95,8 @@ spec:
               mountPath: /etc/clickhouse-operator/chk/templates.d
             - name: etc-keeper-operator-usersd-folder
               mountPath: /etc/clickhouse-operator/chk/users.d
+            - name: clickhouse-operator-ipc
+              mountPath: /etc/clickhouse-operator-ipc
           env:
             # Pod-specific
             # spec.nodeName: ip-172-20-52-62.ec2.internal
@@ -121,21 +131,25 @@ spec:
                 resourceFieldRef:
                   containerName: {{ .Chart.Name }}
                   resource: requests.cpu
+                  divisor: "1m"
             - name: OPERATOR_CONTAINER_CPU_LIMIT
               valueFrom:
                 resourceFieldRef:
                   containerName: {{ .Chart.Name }}
                   resource: limits.cpu
+                  divisor: "1m"
             - name: OPERATOR_CONTAINER_MEM_REQUEST
               valueFrom:
                 resourceFieldRef:
                   containerName: {{ .Chart.Name }}
                   resource: requests.memory
+                  divisor: "1Mi"
             - name: OPERATOR_CONTAINER_MEM_LIMIT
               valueFrom:
                 resourceFieldRef:
                   containerName: {{ .Chart.Name }}
                   resource: limits.memory
+                  divisor: "1Mi"
             {{ with .Values.operator.env }}{{ toYaml . | nindent 12 }}{{ end }}
           ports:
             - containerPort: 9999
@@ -171,6 +185,8 @@ spec:
               mountPath: /etc/clickhouse-operator/chk/templates.d
             - name: etc-keeper-operator-usersd-folder
               mountPath: /etc/clickhouse-operator/chk/users.d
+            - name: clickhouse-operator-ipc
+              mountPath: /etc/clickhouse-operator-ipc
           env:
             # Pod-specific
             # spec.nodeName: ip-172-20-52-62.ec2.internal
@@ -205,21 +221,25 @@ spec:
                 resourceFieldRef:
                   containerName: {{ .Chart.Name }}
                   resource: requests.cpu
+                  divisor: "1m"
             - name: OPERATOR_CONTAINER_CPU_LIMIT
               valueFrom:
                 resourceFieldRef:
                   containerName: {{ .Chart.Name }}
                   resource: limits.cpu
+                  divisor: "1m"
             - name: OPERATOR_CONTAINER_MEM_REQUEST
               valueFrom:
                 resourceFieldRef:
                   containerName: {{ .Chart.Name }}
                   resource: requests.memory
+                  divisor: "1Mi"
             - name: OPERATOR_CONTAINER_MEM_LIMIT
               valueFrom:
                 resourceFieldRef:
                   containerName: {{ .Chart.Name }}
                   resource: limits.memory
+                  divisor: "1Mi"
             {{ with .Values.metrics.env }}{{ toYaml . | nindent 12 }}{{ end }}
           ports:
             - containerPort: 8888

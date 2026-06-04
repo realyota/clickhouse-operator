@@ -15,6 +15,7 @@
 package v1
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 
@@ -35,6 +36,34 @@ const (
 	StatusCompleted   = "Completed"
 	StatusAborted     = "Aborted"
 	StatusTerminating = "Terminating"
+)
+
+// Status reasons distinguish flavors of StatusAborted. The reason is pushed
+// into the error stream so operators can grep / dashboards can branch on it
+// (existing CR status schema has no first-class Reason field — preserving
+// the schema is the back-compat trade-off).
+const (
+	StatusReasonFIPSValidationFailed = "FIPSValidationFailed"
+	// StatusReasonRootCAConflict: both inline RootCA and RootCASecretRef set on
+	// the same security.tls block. User must pick one.
+	StatusReasonRootCAConflict = "RootCAConflict"
+	// StatusReasonRootCASecretUnresolved: the RootCASecretRef points at a Secret
+	// or key that the operator cannot read. Aborts rather than silently falling
+	// back to system roots — empty CA + Verify=Strict would refuse all dials.
+	StatusReasonRootCASecretUnresolved = "RootCASecretUnresolved"
+	// StatusReasonFIPSImagePolicyViolation: security.images.policy=Required
+	// rejected this CR because a ClickHouse/Keeper container image lacks the
+	// "fips" tag substring (admission gate) or the running binary's
+	// `SELECT version()` reply lacks "fips" (post-Ready gate). Separate from
+	// FIPSValidationFailed so dashboards can distinguish operator-config bypass
+	// from per-CR image-policy violations.
+	StatusReasonFIPSImagePolicyViolation = "FIPSImagePolicyViolation"
+	// StatusReasonNoKeeperListener: the CHK cluster has both insecure=no AND
+	// secure=no (or secure unset), so no client-facing Keeper port would be
+	// emitted onto the Service. The resulting CR would be unreachable to
+	// ClickHouse clients. Caught at admission to surface the misconfiguration
+	// instead of producing a silently-broken cluster.
+	StatusReasonNoKeeperListener = "NoKeeperListener"
 )
 
 // Status defines status section of the custom resource.
@@ -331,6 +360,28 @@ func (s *Status) ReconcileAbort() {
 	})
 }
 
+// ReconcileAbortWithReason marks reconcile abortion AND records a reason-tagged
+// error so callers can distinguish flavors of Aborted (e.g. FIPSValidationFailed)
+// from the generic case. The reason is prepended to the message in `[reason] msg`
+// form — operators and dashboards grep the error stream for the bracketed tag.
+func (s *Status) ReconcileAbortWithReason(reason, msg string) {
+	doWithWriteLock(s, func(s *Status) {
+		if s == nil {
+			return
+		}
+		s.Status = StatusAborted
+		s.Action = ""
+		pushTaskIDCompletedNoSync(s)
+		if (reason != "") || (msg != "") {
+			tagged := fmt.Sprintf("[%s] %s", reason, msg)
+			s.Errors = append([]string{tagged}, s.Errors...)
+			if len(s.Errors) > maxErrors {
+				s.Errors = s.Errors[:maxErrors]
+			}
+		}
+	})
+}
+
 // DeleteStart marks deletion start
 func (s *Status) DeleteStart() {
 	doWithWriteLock(s, func(s *Status) {
@@ -362,7 +413,6 @@ func prepareOptions(opts types.CopyStatusOptions) types.CopyStatusOptions {
 		opts.Copy.Actions = true
 		opts.Copy.Errors = true
 		opts.Copy.HostsWithTablesCreated = true
-		opts.Copy.UsedTemplates = true
 	}
 
 	if opts.FieldGroupActions {
@@ -566,8 +616,8 @@ func (s *Status) CopyFrom(f *Status, opts types.CopyStatusOptions) {
 				}
 			}
 			if opts.Copy.UsedTemplates {
-				if len(from.UsedTemplates) > len(s.UsedTemplates) {
-					s.UsedTemplates = nil
+				s.UsedTemplates = nil
+				if len(from.UsedTemplates) > 0 {
 					s.UsedTemplates = append(s.UsedTemplates, from.UsedTemplates...)
 				}
 			}
@@ -869,7 +919,16 @@ func getStringArrWithReadLock(s *Status, f func(*Status) []string) []string {
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return f(s)
+	// Return a COPY so callers may iterate the snapshot after the read lock is
+	// released without racing concurrent writers (PushError/SetAndPushError/
+	// ReconcileAbortWithReason mutate the underlying slice).
+	src := f(s)
+	if src == nil {
+		return emptyArr
+	}
+	cp := make([]string, len(src))
+	copy(cp, src)
+	return cp
 }
 
 // mergeActionsNoSync merges the actions of from into those of s (without synchronization, because synchronized

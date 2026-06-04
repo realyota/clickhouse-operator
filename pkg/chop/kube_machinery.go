@@ -32,21 +32,37 @@ import (
 	chopclientset "github.com/altinity/clickhouse-operator/pkg/client/clientset/versioned"
 )
 
+// lastKubeConfigInsecure records whether the most recently loaded kubeconfig
+// had TLSClientConfig.Insecure=true. Captured here at load time so the
+// post-file-load gate inside ConfigManager.Init can decide whether to fail
+// fast based on security.kubernetes.tls.verify.
+var lastKubeConfigInsecure bool
+
+// captureInsecure records the Insecure flag on conf (if non-nil). Returns
+// conf+err unchanged so callers can chain it onto BuildConfigFromFlags/
+// InClusterConfig results.
+func captureInsecure(conf *kuberest.Config, err error) (*kuberest.Config, error) {
+	if (err == nil) && (conf != nil) {
+		lastKubeConfigInsecure = conf.TLSClientConfig.Insecure
+	}
+	return conf, err
+}
+
 // getKubeConfig creates kuberest.Config object based on current environment
 func getKubeConfig(kubeConfigFile, masterURL string) (*kuberest.Config, error) {
 	if len(kubeConfigFile) > 0 {
-		// kube config file specified as CLI flag
-		return kubeclientcmd.BuildConfigFromFlags(masterURL, kubeConfigFile)
+		log.F().Info("kubeconfig auth source: --kubeconfig flag (%s)", kubeConfigFile)
+		return captureInsecure(kubeclientcmd.BuildConfigFromFlags(masterURL, kubeConfigFile))
 	}
 
 	if len(os.Getenv("KUBECONFIG")) > 0 {
-		// kube config file specified as ENV var
-		return kubeclientcmd.BuildConfigFromFlags(masterURL, os.Getenv("KUBECONFIG"))
+		log.F().Info("kubeconfig auth source: KUBECONFIG env (%s)", os.Getenv("KUBECONFIG"))
+		return captureInsecure(kubeclientcmd.BuildConfigFromFlags(masterURL, os.Getenv("KUBECONFIG")))
 	}
 
 	if conf, err := kuberest.InClusterConfig(); err == nil {
-		// in-cluster configuration found
-		return conf, nil
+		log.F().Info("kubeconfig auth source: in-cluster ServiceAccount")
+		return captureInsecure(conf, nil)
 	}
 
 	usr, err := user.Current()
@@ -54,14 +70,14 @@ func getKubeConfig(kubeConfigFile, masterURL string) (*kuberest.Config, error) {
 		return nil, fmt.Errorf("user not found")
 	}
 
-	// OS user found. Parse ~/.kube/config file
-	conf, err := kubeclientcmd.BuildConfigFromFlags("", filepath.Join(usr.HomeDir, ".kube", "config"))
+	homeConfig := filepath.Join(usr.HomeDir, ".kube", "config")
+	conf, err := kubeclientcmd.BuildConfigFromFlags("", homeConfig)
 	if err != nil {
 		return nil, fmt.Errorf("~/.kube/config not found")
 	}
 
-	// ~/.kube/config found
-	return conf, nil
+	log.F().Info("kubeconfig auth source: %s", homeConfig)
+	return captureInsecure(conf, nil)
 }
 
 // GetClientset gets k8s API clients - both kube native client and our custom client

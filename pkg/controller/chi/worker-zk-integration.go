@@ -16,6 +16,7 @@ package chi
 
 import (
 	api "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
+	"github.com/altinity/clickhouse-operator/pkg/chop"
 	a "github.com/altinity/clickhouse-operator/pkg/controller/common/announcer"
 	"github.com/altinity/clickhouse-operator/pkg/model/zookeeper"
 )
@@ -24,6 +25,18 @@ func (w *worker) reconcileClusterZookeeperRootPath(cluster *api.Cluster) error {
 	// Cluster ZK path reconciliation is optional
 	if !shouldReconcileClusterZookeeperPath(cluster) {
 		// Nothing to reconcile
+		return nil
+	}
+
+	// When the resolved ZK ensemble is TLS-only, the operator's
+	// plaintext go-zookeeper dial cannot reach it. The bundled client has no
+	// TLS-aware path-ensure today, so skip the precreation step and let the
+	// ClickHouse server itself create the root path on its first DDL — that
+	// dial happens inside ClickHouse over its (TLS-aware) Keeper client.
+	if clusterZookeeperRequiresTLSDial(cluster) {
+		w.a.V(1).M(cluster.GetCR()).F().
+			Info("Skip ZK root-path ensure for cluster %s/%s/%s: ensemble is TLS-only and the operator dial is plaintext",
+				cluster.GetCR().GetNamespace(), cluster.GetCR().GetName(), cluster.GetName())
 		return nil
 	}
 
@@ -46,8 +59,46 @@ func (w *worker) reconcileClusterZookeeperRootPath(cluster *api.Cluster) error {
 	return nil
 }
 
+// clusterZookeeperRequiresTLSDial reports whether any resolved ZK node is
+// marked Secure (port 2281 / zk-secure / explicit secure flag). The
+// go-zookeeper client embedded in the operator does not speak TLS without
+// CertFile/KeyFile material, which the operator does not provision today.
+// Callers that would otherwise open a plaintext socket should bail out and
+// rely on ClickHouse itself for the dial.
+func clusterZookeeperRequiresTLSDial(cluster *api.Cluster) bool {
+	if (cluster == nil) || cluster.Zookeeper.IsEmpty() {
+		return false
+	}
+	for _, node := range cluster.Zookeeper.Nodes {
+		if node.Secure.IsTrue() {
+			return true
+		}
+	}
+	return false
+}
+
 func ensureZkPath(cluster *api.Cluster) {
-	conn := zookeeper.NewConnection(cluster.Zookeeper.Nodes)
+	// Plumb cluster-level security.zookeeper.tls.{minVersion,verify} into the
+	// ZK dial. Defaults preserve current behavior (Go default TLS version,
+	// strict verify since RootCAs+ServerName are always set). CHOP-config
+	// defaults reach here via InheritClusterSecurityFrom + normalizeClusterSecurity.
+	zk := cluster.GetSecurity().GetZookeeper().GetTLS()
+	mv := zk.GetMinVersion()
+	verify := zk.GetVerify()
+	// FIPS-compatible mode rejects ZK digest-auth (SHA-1 password hashing
+	// inside the vendored go-zookeeper library). Pulled at dial-construction
+	// time so each connection inherits the chopconf decision atomically.
+	// Fires under EITHER security.policy=Enforced OR security.fips.enforced=true.
+	rejectDigest := chop.Config().Security.RequiresHardening()
+	var params *zookeeper.ConnectionParams
+	if (mv != "") || (verify == api.TLSVerifyNone) || rejectDigest {
+		params = &zookeeper.ConnectionParams{
+			MinTLSVersion:      string(mv),
+			InsecureSkipVerify: verify == api.TLSVerifyNone,
+			RejectDigestAuth:   rejectDigest,
+		}
+	}
+	conn := zookeeper.NewConnection(cluster.Zookeeper.Nodes, params)
 	path := zookeeper.NewPathManager(conn)
 	path.Ensure(cluster.Zookeeper.Root)
 	path.Close()

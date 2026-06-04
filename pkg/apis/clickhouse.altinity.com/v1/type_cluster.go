@@ -29,6 +29,7 @@ type Cluster struct {
 	Insecure          *types.StringBool `json:"insecure,omitempty"          yaml:"insecure,omitempty"`
 	Secure            *types.StringBool `json:"secure,omitempty"            yaml:"secure,omitempty"`
 	Secret            *ClusterSecret    `json:"secret,omitempty"            yaml:"secret,omitempty"`
+	Security          *ClusterSecurity  `json:"security,omitempty"          yaml:"security,omitempty"`
 	PDBManaged        *types.StringBool `json:"pdbManaged,omitempty"        yaml:"pdbManaged,omitempty"`
 	PDBMaxUnavailable *types.Int32      `json:"pdbMaxUnavailable,omitempty" yaml:"pdbMaxUnavailable,omitempty"`
 	Reconcile         *ClusterReconcile `json:"reconcile,omitempty"         yaml:"reconcile,omitempty"`
@@ -138,7 +139,18 @@ func (cluster *Cluster) GetSecure() *types.StringBool {
 
 // GetSecret is a getter
 func (c *Cluster) GetSecret() *ClusterSecret {
+	if c == nil {
+		return nil
+	}
 	return c.Secret
+}
+
+// GetSecurity returns the cluster-level Security block, nil-safe.
+func (c *Cluster) GetSecurity() *ClusterSecurity {
+	if c == nil {
+		return nil
+	}
+	return c.Security
 }
 
 // GetPDBManaged is a getter
@@ -228,6 +240,25 @@ func (cluster *Cluster) InheritFilesFrom(chi *ClickHouseInstallation) {
 
 		return false
 	})
+}
+
+// InheritClusterSecurityFrom inherits security knobs from the CHI spec into this
+// cluster. Fills only empty fields, so cluster-level overrides win over CHI-level.
+// Pattern mirrors InheritClusterReconcileFrom; the full 3-level inheritance
+// (CHOP-config → CHI → cluster) is completed in normalizeClusterSecurity.
+func (cluster *Cluster) InheritClusterSecurityFrom(chi *ClickHouseInstallation) {
+	if chi == nil {
+		return
+	}
+	specSecurity := chi.Spec.GetSecurity()
+	if specSecurity == nil {
+		return
+	}
+	if cluster.Security == nil {
+		cluster.Security = &ClusterSecurity{}
+	}
+	cluster.Security.ClickHouse = cluster.Security.ClickHouse.MergeFrom(specSecurity.GetClickHouse(), MergeTypeFillEmptyValues)
+	cluster.Security.Zookeeper = cluster.Security.Zookeeper.MergeFrom(specSecurity.GetZookeeper(), MergeTypeFillEmptyValues)
 }
 
 // InheritClusterReconcileFrom inherits reconcile runtime from CHI

@@ -109,6 +109,11 @@ type IStatus interface {
 	HostAdded()
 	HostFailed()
 	HostCompleted()
+
+	// ReconcileAbortWithReason marks the CR Aborted and prepends a
+	// reason-tagged error to the error stream. Callers reach this via
+	// ICustomResource.IEnsureStatus().
+	ReconcileAbortWithReason(reason, msg string)
 }
 
 type ICluster interface {
@@ -122,6 +127,7 @@ type ICluster interface {
 	GetInsecure() *types.StringBool
 	GetSecure() *types.StringBool
 	GetSecret() *ClusterSecret
+	GetSecurity() *ClusterSecurity
 	GetPDBManaged() *types.StringBool
 	GetPDBMaxUnavailable() *types.Int32
 

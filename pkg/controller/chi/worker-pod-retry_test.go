@@ -106,6 +106,13 @@ func TestShouldTriggerAutoRecovery(t *testing.T) {
 		return cr
 	}
 
+	// withError builds an Aborted CR carrying a reason-tagged latest error.
+	withError := func(reason, msg string) *api.ClickHouseInstallation {
+		cr := makeCR(api.StatusAborted, false)
+		cr.EnsureStatus().Errors = []string{"[" + reason + "] " + msg}
+		return cr
+	}
+
 	tests := []struct {
 		name     string
 		cr       *api.ClickHouseInstallation
@@ -118,6 +125,18 @@ func TestShouldTriggerAutoRecovery(t *testing.T) {
 		{"Terminating — reject", makeCR(api.StatusTerminating, false), false},
 		{"Aborted but being deleted — reject", makeCR(api.StatusAborted, true), false},
 		{"empty status (fresh CR) — reject", makeCR("", false), false},
+		// Normalize-time abort reasons: pod-Ready flips can't recover these.
+		{"Aborted with FIPSValidationFailed — reject (spec edit required)",
+			withError(api.StatusReasonFIPSValidationFailed, "ZK plain-text rejected"), false},
+		{"Aborted with RootCAConflict — reject",
+			withError(api.StatusReasonRootCAConflict, "rootCA and rootCASecretRef both set"), false},
+		{"Aborted with RootCASecretUnresolved — reject",
+			withError(api.StatusReasonRootCASecretUnresolved, "secret/key not found"), false},
+		{"Aborted with FIPSImagePolicyViolation — reject",
+			withError(api.StatusReasonFIPSImagePolicyViolation, "image lacks fips marker"), false},
+		// Generic Aborted with an unrecognized reason tag — still a recovery target.
+		{"Aborted with unrecognized reason — accept",
+			withError("SomeOtherReason", "generic abort"), true},
 	}
 
 	for _, tc := range tests {

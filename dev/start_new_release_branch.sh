@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # Start new release branch
 
@@ -86,14 +87,14 @@ cat "${SRC_ROOT}/release"
 head -n3 "${SRC_ROOT}/releases"
 
 echo "git status:"
-$(cd "${SRC_ROOT}" && git status)
+git -C "${SRC_ROOT}" status
 
-$(cd "${SRC_ROOT}" && go mod vendor)
-$(cd "${SRC_ROOT}" && ./dev/go_build_all.sh )
-$(cd "${SRC_ROOT}" && git add deploy/operator/)
-$(cd "${SRC_ROOT}" && git commit -m "env: manifests")
-$(cd "${SRC_ROOT}" && git add deploy/helm/)
-$(cd "${SRC_ROOT}" && git commit -m "env: helm chart")
+(cd "${SRC_ROOT}" && go mod vendor)
+(cd "${SRC_ROOT}" && ./dev/go_build_all.sh)
+git -C "${SRC_ROOT}" add deploy/operator/
+git -C "${SRC_ROOT}" commit -m "env: manifests"
+git -C "${SRC_ROOT}" add deploy/helm/
+git -C "${SRC_ROOT}" commit -m "env: helm chart"
 
 echo "git status:"
-$(cd "${SRC_ROOT}" && git status)
+git -C "${SRC_ROOT}" status

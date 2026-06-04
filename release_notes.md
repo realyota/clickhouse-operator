@@ -1,3 +1,9 @@
+## Release 0.27.1
+### Behavior Changes
+* `StatefulSet` create returning `AlreadyExists` (e.g. due to a stale informer cache or a prior failed delete) is no longer silently treated as a successful create. The reconciler now propagates the recreate sentinel so the host correctly enters the recreate path. See https://github.com/Altinity/clickhouse-operator/pull/1993.
+
+**Note**: Pre-existing CHIs that were sitting in the previously-swallowed state (typically observable as a host stuck at `Replicas=0` while the CHI was reported as reconciled) will now correctly transition to `Aborted` status on first reconcile after upgrade. This is the intended behavior - the prior code masked a real failure. To recover, re-apply the CHI spec to trigger an informer re-reconcile.
+
 ## Release 0.20.3
 ## What's Changed
 * Use alpine base image instead of UBI

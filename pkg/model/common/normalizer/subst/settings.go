@@ -212,6 +212,13 @@ type SecretGetter func(namespace, name string) (*core.Secret, error)
 
 var ErrSecretValueNotFound = fmt.Errorf("secret value not found")
 
+// FetchSecretFieldValue fetches the value of the specified field in the specified
+// Secret. Exported wrapper around the internal fetcher so consumers outside the
+// Settings substitution path (e.g. security.tls.rootCASecretRef) can reuse it.
+func FetchSecretFieldValue(secretAddress types.ObjectAddress, secretGet SecretGetter) (string, error) {
+	return fetchSecretFieldValue(secretAddress, secretGet)
+}
+
 // fetchSecretFieldValue fetches the value of the specified field in the specified secret
 // TODO this is the only usage of k8s API in the normalizer. How to remove it?
 func fetchSecretFieldValue(secretAddress types.ObjectAddress, secretGet SecretGetter) (string, error) {

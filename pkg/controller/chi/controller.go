@@ -18,7 +18,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -782,13 +781,10 @@ func (c *Controller) deleteChopConfig(chopConfig *api.ClickHouseOperatorConfigur
 }
 
 func (c *Controller) restartOperatorOnConfigChange(reason string) {
-	if !chop.Config().RestartOnOperatorConfigurationChange() {
-		log.V(1).Info("Operator restart on configuration change is disabled")
-		return
-	}
-
-	log.Info("Operator restart requested: %s", reason)
-	os.Exit(0)
+	// Delegate to the shared helper so the operator and the metrics-exporter
+	// react to ClickHouseOperatorConfiguration changes identically. See
+	// chop.RestartOnConfigChange and the exporter's chopconf watcher.
+	chop.RestartOnConfigChange(reason)
 }
 
 type patchFinalizers struct {

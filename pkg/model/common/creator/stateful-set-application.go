@@ -201,6 +201,11 @@ func (c *Creator) stsEnsureAppContainerNamedPortsSpecified(statefulSet *apps.Sta
 	// Walk over all assigned ports of the host and ensure each port in container
 	host.WalkSpecifiedPorts(
 		func(name string, port *types.Int32, protocol core.Protocol) bool {
+			// Suppress the plaintext Keeper ZK client port when the host opts out of insecure exposure;
+			// mirrors appendHostExposedContainerPorts so a user-supplied podTemplate cannot reintroduce it.
+			if (name == api.KpDefaultZKPortName) && !host.IsInsecure() {
+				return false
+			}
 			k8s.ContainerEnsurePortByName(container, name, port.Value())
 			// Do not abort, continue iterating
 			return false

@@ -63,6 +63,24 @@ func (w *worker) reconcileCR(ctx context.Context, old, new *apiChk.ClickHouseKee
 
 	new = w.buildCR(ctx, new)
 
+	// If buildCR's normalize already aborted the CR (e.g. FIPS strict rejected
+	// plain-text security bypass), persist the abort and skip reconcile —
+	// otherwise markReconcileStart below would overwrite Status=Aborted with
+	// InProgress. Recovery is via spec edit: informer UpdateFunc re-enqueues
+	// on next apply.
+	if new.EnsureStatus().GetStatus() == api.StatusAborted {
+		w.a.M(new).F().Info("Normalize marked CR Aborted — skipping reconcile (recovery via spec edit)")
+		_ = w.c.updateCRObjectStatus(ctx, new, types.UpdateStatusOptions{
+			CopyStatusOptions: types.CopyStatusOptions{
+				CopyStatusFieldGroup: types.CopyStatusFieldGroup{
+					FieldGroupMain: true,
+				},
+			},
+		})
+		metrics.CRReconcilesAborted(ctx, new)
+		return nil
+	}
+
 	switch {
 	case new.Spec.Suspend.Value():
 		// if CR is suspended, should skip reconciliation
@@ -259,17 +277,19 @@ func (w *worker) reconcileCRAuxObjectsPreliminary(ctx context.Context, cr *apiCh
 }
 
 func (w *worker) reconcileCRAuxObjectsPreliminaryDomain(ctx context.Context, cr *apiChk.ClickHouseKeeperInstallation) error {
+	// Use a context-aware wait so a controller shutdown does not stall the
+	// worker for up to two minutes mid-reconcile. The wait windows below are
+	// best-effort pacing only; the function returns early on ctx cancellation.
+	var d time.Duration
 	switch {
 	case cr.HostsCount() < cr.GetAncestor().HostsCount():
-		// Downscale
-		time.Sleep(120 * time.Second)
+		d = 120 * time.Second
 	case cr.HostsCount() > cr.GetAncestor().HostsCount():
-		// Upscale
-		time.Sleep(30 * time.Second)
+		d = 30 * time.Second
 	default:
-		// Same size
-		time.Sleep(10 * time.Second)
+		d = 10 * time.Second
 	}
+	util.WaitContextDoneOrTimeout(ctx, d)
 	return nil
 }
 
@@ -813,9 +833,10 @@ func (w *worker) reconcileHostMainDomain(ctx context.Context, host *api.Host) er
 		wait = true
 	}
 
-	// Wait for host to startup
+	// Wait for host to startup; respect ctx cancellation so the worker
+	// unblocks on controller shutdown instead of running out the timer.
 	if wait {
-		time.Sleep(7 * time.Second)
+		util.WaitContextDoneOrTimeout(ctx, 7*time.Second)
 	}
 	return nil
 }

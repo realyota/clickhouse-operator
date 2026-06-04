@@ -58,10 +58,24 @@ func initClickHouse(ctx context.Context) {
 	// Initialize k8s API clients
 	kubeClient, extClient, chopClient, dynamicClient := chop.GetClientset(kubeConfigFile, masterURL)
 
-	// Create operator instance
+	// Create operator instance. The chopconf load inside chop.New gates on
+	// clickhouse.security.kubernetes.allowInsecure BEFORE the first network call,
+	// so an insecure kubeconfig forbidden by chopconf will Fatal here rather than
+	// after the first List has already crossed the wire.
 	chop.New(kubeClient, chopClient, chopConfigFile)
 	log.V(1).F().Info("Config parsed:")
 	log.Info("\n" + chop.Config().String(true))
+
+	// Validate the runtime FIPS posture against chopconf security.policy.
+	// Fatals when chopconf requires FIPS but the binary/runtime can't deliver.
+	fipsGate()
+
+	// Provision the operator↔exporter IPC token. No-op in Plain mode (default).
+	// In Secure mode this writes a fresh random token to the shared-volume path
+	// before the metrics-exporter sidecar polls for it.
+	if err := chop.ProvisionIPCToken(); err != nil {
+		log.F().Fatal("IPC token provisioning failed: %s", err.Error())
+	}
 	if chop.Config().RestartOnOperatorConfigurationChange() {
 		log.Info("Auto-restart on ClickHouseOperatorConfiguration change is enabled")
 	} else {

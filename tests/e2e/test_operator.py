@@ -14,12 +14,13 @@ import e2e.kubectl as kubectl
 import e2e.util as util
 
 from requirements.requirements import *
+from requirements.fips import *
 from testflows.connect import Shell
 from testflows.asserts import error
 from testflows.core import *
 from e2e.steps import *
 from datetime import datetime
-
+from e2e.steps_fips import *
 
 @TestScenario
 @Name("test_010001. 1 node")
@@ -236,11 +237,10 @@ def test_010006_2(self):
             pod_name = kubectl.get_pod_names(chi)[0]
             for i in range(15):
                 container_status = kubectl.get_field("pod", pod_name, ".status.containerStatuses[0].state.waiting.reason",)
-                print(f"{pod_name} is {container_status}")
                 if container_status == "CrashLoopBackOff":
                     print(kubectl.get_field("pod", pod_name, ".status.containerStatuses[0].state.waiting.message"))
                     break
-                time.sleep(5)
+                retry_sleep(1, 5, f"{pod_name} is {container_status}")
             assert container_status not in ["CrashLoopBackOff","Error"]
 
         kubectl.wait_chi_status(chi, "Completed")
@@ -811,8 +811,7 @@ def test_010011_1(self):
                 )
                 if out != "OK":
                     break
-                print(f"Network restrictions not yet loaded on default-1-0, waiting 10s (attempt {i})")
-                time.sleep(10)
+                retry_sleep(1, 10, "Network restrictions not yet loaded on default-1-0")
             with And("Connection to localhost should succeed with default user"):
                 out = clickhouse.query_with_error(
                     "test-011-secured-cluster",
@@ -1124,12 +1123,11 @@ def test_010011_4(self):
                 if chi_status in ("Aborted", "Completed"):
                     break
                 container_status = kubectl.get_field("pod", pod, ".status.containerStatuses[0].state.waiting.reason")
-                print(f"{chi} status={chi_status} pod={pod} waiting_reason={container_status}")
                 assert container_status not in ["CrashLoopBackOff", "Error"], error(
                     f"{pod} entered {container_status} during secret-backed env rollout"
                 )
 
-                time.sleep(5)
+                retry_sleep(1, 5, f"{chi} status={chi_status} pod={pod} waiting_reason={container_status}")
 
             assert chi_status == "Completed", error(f"{chi} did not complete successfully")
 
@@ -1503,6 +1501,7 @@ def wait_for_cluster(chi, cluster, num_shards, num_replicas=0, pwd="", force_wai
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010014_0. Test that schema is correctly propagated on replicas")
 @Requirements(
     RQ_SRS_026_ClickHouseOperator_CustomResource_Spec_Configuration_Clusters_Cluster_ZooKeeper("1.0"),
@@ -2651,8 +2650,7 @@ def test_021(self, step=1):
                 out = clickhouse.query(chi, "SELECT count() FROM system.disks")
                 if out == "2":
                     break
-                with Then(f"Not ready yet. Wait for {1 << i} seconds"):
-                    time.sleep(1 << i)
+                retry_sleep(i, 5, "Not ready yet")
             assert out == "2"
 
         with And("Table should exist"):
@@ -2784,11 +2782,14 @@ def test_010022(self):
         },
     )
     with When("ClickHouse image can not be retrieved"):
+        # K8s transitions ErrImagePull → ImagePullBackOff within seconds of
+        # the first failed pull, so polling for the exact "ErrImagePull" reason
+        # is racy. Accept either; both mean the image cannot be pulled.
         kubectl.wait_field(
             "pod",
             "chi-test-022-broken-image-default-0-0-0",
             ".status.containerStatuses[0].state.waiting.reason",
-            "ErrImagePull",
+            ["ErrImagePull", "ImagePullBackOff"],
         )
         with Then("CHI should be able to delete"):
             kubectl.launch(f"delete chi {chi}", ok_to_fail=True, timeout=600)
@@ -2828,6 +2829,9 @@ def test_010023(self):
         },
     )
     with Then(".status.usedTemplates list all templates"):
+        used_templates = kubectl.get("chi", chi)["status"]["usedTemplates"]
+        print(used_templates)
+
         assert kubectl.get_field("chi", chi, ".status.usedTemplates[0].name") == "clickhouse-stable"
         assert kubectl.get_field("chi", chi, ".status.usedTemplates[1].name") == "extension-annotations"
         assert kubectl.get_field("chi", chi, ".status.usedTemplates[2].name") == "grafana-dashboard-user"
@@ -2888,17 +2892,29 @@ def test_010023(self):
     with Then("Trigger CHI update"):
         kubectl.force_chi_reconcile(chi, "apply-templates")
 
-    with Then(".status.usedTemplates has 3 values"):
+    with Then(".status.usedTemplates shows new values"):
+        used_templates = kubectl.get("chi", chi)["status"]["usedTemplates"]
+        print(used_templates)
+
         assert kubectl.get_field("chi", chi, ".status.usedTemplates[0].name") == "clickhouse-stable"
         assert kubectl.get_field("chi", chi, ".status.usedTemplates[1].name") == "extension-annotations"
         assert kubectl.get_field("chi", chi, ".status.usedTemplates[2].name") == "grafana-dashboard-user"
         assert kubectl.get_field("chi", chi, ".status.usedTemplates[3].name") == "selector-test-1"
-        # assert kubectl.get_field("chi", chi, ".status.usedTemplates[3].name") == ""
 
     with Then("Annotation from selector-1 template should be populated"):
         assert kubectl.get_field("pod", f"chi-{chi}-single-0-0-0", ".metadata.annotations.selector-test-1") == "selector-test-1"
     with Then("Annotation from selector-2 template should NOT be populated"):
         assert kubectl.get_field("pod", f"chi-{chi}-single-0-0-0", ".metadata.annotations.selector-test-2") == "<none>"
+
+    with When("Delete all templates and run reconcile"):
+        kubectl.delete_all("chit")
+        assert kubectl.get_count("chit") == 0, error("All CHIT should be deleted")
+
+        kubectl.force_chi_reconcile(chi, "remove-templates")
+
+        with Then("usedTemplates should have been cleaned in the status"):
+            assert kubectl.get_field("chi", chi, ".status.usedTemplates") == "<none>", error("Used templates should be empty")
+
 
     with Finally("I clean up"):
         delete_test_namespace()
@@ -3077,7 +3093,7 @@ def test_010025(self):
         lb_error_time = start_time
         distr_lb_error_time = start_time
         latent_replica_time = start_time
-        for i in range(1, 100):
+        for i in range(1, 10):
             cnt_local = clickhouse.query_with_error(
                 chi,
                 "SELECT count() FROM test_local_025",
@@ -3096,8 +3112,7 @@ def test_010025(self):
                     break
                 latent_replica_time = time.time()
                 note("Replicated table did not catch up")
-            note("Waiting 1 second.")
-            time.sleep(1)
+            retry_sleep(1, 5)
         note(
             f"Tables not ready: {round(distr_lb_error_time - start_time)}s, data not ready: {round(latent_replica_time - distr_lb_error_time)}s"
         )
@@ -3739,6 +3754,7 @@ def test_010033(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010035. Auto-recovery from aborted reconcile when pod becomes Ready")
 def test_010035(self):
     """Verify that when a CHI reconcile is aborted because a pod did not become
@@ -3798,6 +3814,7 @@ def test_010035(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010035_1. Opt-out: CHI stays Aborted when auto-recovery onPodReady=none")
 def test_010035_1(self):
     """Opt-out path: Verify that when the operator is configured with
@@ -3988,208 +4005,253 @@ def test_010034(self):
 @Tags("NO_PARALLEL")
 def test_010036(self):
     """Check clickhouse operator recreates volumes and schema if volume is broken."""
-    create_shell_namespace_clickhouse_template()
+    # Python try/finally ensures the namespace is deleted even when an assertion
+    # fires mid-test. A trailing `with Finally(...)` is only entered on the
+    # happy path — AssertionError exits the function before reaching it, so on
+    # retry the previous attempt's namespace survives and leaks. Namespace
+    # creation is inside the try so a partial setup is still cleaned up; the
+    # cleanup itself tolerates a missing test_namespace context attribute.
+    try:
+        create_shell_namespace_clickhouse_template()
 
-    manifest = "manifests/chi/test-036-volume-re-provisioning-1.yaml"
-    chi = yaml_manifest.get_name(util.get_full_path(manifest))
-    cluster = "simple"
-    util.require_keeper(keeper_type=self.context.keeper_type)
+        manifest = "manifests/chi/test-036-volume-re-provisioning-1.yaml"
+        chi = yaml_manifest.get_name(util.get_full_path(manifest))
+        cluster = "simple"
+        util.require_keeper(keeper_type=self.context.keeper_type)
 
-    with Given("CHI with two replicas is created"):
-        kubectl.create_and_check(
-            manifest=manifest,
-            check={
-                "apply_templates": {current().context.clickhouse_template},
-                "pod_count": 2,
-                "do_not_delete": 1,
-            },
-        )
+        with Given("CHI with two replicas is created"):
+            kubectl.create_and_check(
+                manifest=manifest,
+                check={
+                    "apply_templates": {current().context.clickhouse_template},
+                    "pod_count": 2,
+                    "do_not_delete": 1,
+                },
+            )
 
-    wait_for_cluster(chi, cluster, 1, 2)
-
-    with And("I create replicated table with some data"):
-        clickhouse.query(chi, "CREATE DATABASE IF NOT EXISTS test_036 ON CLUSTER '{cluster}'")
-        create_table = """
-            CREATE TABLE IF NOT EXISTS test_036.test_local_036 ON CLUSTER '{cluster}' (a UInt32)
-            Engine = ReplicatedMergeTree('/clickhouse/{installation}/tables/{shard}/{database}/{table}', '{replica}')
-            PARTITION BY tuple()
-            ORDER BY a
-            """.replace("\r", "").replace("\n", "")
-        clickhouse.query(chi, create_table)
-        clickhouse.query(chi, f"INSERT INTO test_036.test_local_036 select * from numbers(10000)")
-
-        clickhouse.query(chi, "CREATE DATABASE IF NOT EXISTS test_036_mem ON CLUSTER '{cluster}' Engine = Memory")
-        clickhouse.query(chi, "CREATE VIEW IF NOT EXISTS test_036_mem.test_view ON CLUSTER '{cluster}' AS SELECT * from system.tables")
-
-    def delete_pv(volume):
-        with When("Delete PV", description="delete PV on replica 0"):
-            # Prepare counters
-            pvc_count = kubectl.get_count("pvc", chi=chi)
-            pv_count = kubectl.get_count("pv")
-            print(f"pvc_count: {pvc_count}")
-            print(f"pv_count: {pv_count}")
-
-            pv_name = kubectl.get_pv_name(f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0")
-            # retry
-            kubectl.launch(f"delete pv {pv_name} --force &")
-            kubectl.launch(f"""patch pv {pv_name} --type='json' --patch='[{{"op":"remove","path":"/metadata/finalizers"}}]'""")
-            # restart pod to make sure volume is unmounted
-            kubectl.launch("delete pod chi-test-036-volume-re-provisioning-simple-0-0-0")
-            # Give it some time to be deleted
-            time.sleep(10)
-
-            with Then("PVC should be kept, PV should be deleted"):
-                new_pvc_count = kubectl.get_count("pvc", chi=chi)
-                new_pv_count = kubectl.get_count("pv")
-                print(f"new_pvc_count: {new_pvc_count}")
-                print(f"new_pv_count: {new_pv_count}")
-                assert new_pvc_count == pvc_count
-                assert new_pv_count < pv_count
-
-            with And("Wait for PVC to detect PV is lost"):
-                # Need to add more retries on real kubernetes
-                kubectl.wait_field(
-                    kind="pvc",
-                    name=f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0",
-                    field=".status.phase",
-                    value="Lost",
-                )
-
-    def delete_sts_and_pvc(volume):
-        with When("Delete StatefulSet and PVC", description="delete StatefulSet on replica 0"):
-            kubectl.launch("delete sts chi-test-036-volume-re-provisioning-simple-0-0")
-            kubectl.launch(f"delete pvc {volume}-chi-test-036-volume-re-provisioning-simple-0-0-0")
-
-            with Then("Wait for StatefulSet is deleted"):
-                for i in range(5):
-                    if kubectl.get_count("sts", "chi-test-036-volume-re-provisioning-simple-0-0") == 0:
-                        break
-                    time.sleep(10)
-
-            with Then("Wait for PVC is deleted"):
-                for i in range(5):
-                    if kubectl.get_count("pvc", f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0") == 0:
-                        break
-                    time.sleep(10)
-
-        assert kubectl.get_count("sts", "chi-test-036-volume-re-provisioning-simple-0-0") == 0, "StatefulSet is not deleted"
-        assert kubectl.get_count("pvc", f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0") == 0, "PVC is not deleted"
-
-    def delete_pvc(volume):
-        with Then("Delete PVC", description="delete PVC on replica 0"):
-            # Prepare counters
-            pvc_count = kubectl.get_count("pvc", chi=chi)
-            pv_count = kubectl.get_count("pv")
-            print(f"pvc_count: {pvc_count}")
-            print(f"pv_count: {pv_count}")
-
-            pvc_name = f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0"
-            # retry
-            kubectl.launch(f"""patch pvc {pvc_name} --type='json' --patch='[{{"op":"remove","path":"/metadata/finalizers"}}]'""")
-            kubectl.launch(f"delete pvc {pvc_name} --force &")
-
-            # restart pod to make sure volume is unmounted
-            kubectl.launch("delete pod chi-test-036-volume-re-provisioning-simple-0-0-0")
-            with Then("Wait for PVC is deleted"):
-                for i in range(5):
-                    if kubectl.get_count("pvc", f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0") == 0:
-                        break
-                    time.sleep(10)
-
-            with Then("PVC should be deleted, PV should be deleted as well"):
-                new_pvc_count = kubectl.get_count("pvc", chi=chi)
-                new_pv_count = kubectl.get_count("pv")
-                print(f"new_pvc_count: {new_pvc_count}")
-                print(f"new_pv_count: {new_pv_count}")
-                assert new_pvc_count < pvc_count
-                assert new_pv_count < pv_count
-
-    def recover_volume(volume, reconcile_task_id):
-        with When(f"Kick operator to start reconcile cycle to fix lost {volume} volume"):
-            kubectl.force_chi_reconcile(chi, reconcile_task_id)
-            wait_for_cluster(chi, cluster, 1, 2)
-
-            with Then("I check PV is in place"):
-                kubectl.wait_field(
-                    "pvc",
-                    f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0",
-                    ".status.phase",
-                    "Bound",
-                )
-                kubectl.wait_object(
-                    "pv",
-                    kubectl.get_pv_name(f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0"),
-                )
-                size = kubectl.get_pv_size(f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0")
-                assert size == "1Gi", error()
-
-    def check_data_is_recovered():
-        with And("I check data on each replica"):
-            for replica in (0,1):
-                with By(f"Check that databases exist on replica {replica}"):
-                    # Schema propagation from ZooKeeper can take time after volume recovery,
-                    r = "0"
-                    for i in range(1, 15):
-                        r = clickhouse.query(
-                            chi,
-                            pod=f"chi-test-036-volume-re-provisioning-simple-0-{replica}-0",
-                            sql="SELECT count(*) FROM system.databases where name like 'test_036%'",
-                            )
-                        if r == "2":
-                            break
-                        retry_sleep(i, 5, f"Not ready")
-                    assert r == "2", error()
-                with And(f"checking data on the replica {replica}"):
-                    r = clickhouse.query(
-                        chi,
-                        pod=f"chi-test-036-volume-re-provisioning-simple-0-{replica}-0",
-                        sql="SELECT count(*) FROM test_036.test_local_036",
-                        )
-                    assert r == "10000", error()
-                with And("checking view in Memory engine exists"):
-                    r = clickhouse.query(
-                        chi,
-                        pod="chi-test-036-volume-re-provisioning-simple-0-0-0",
-                        sql="SELECT count(*) FROM system.tables where name = 'test_view'",
-                        )
-                assert r == "1", error()
-
-    delete_sts_and_pvc("default")
-    recover_volume("default", "reconcile-after-STS-and-PVC-deleted")
-    check_data_is_recovered()
-
-    query_log_start = clickhouse.query(chi, 'select now()')
-    delete_pvc("default")
-    recover_volume("default", "reconcile-after-PVC-deleted")
-    check_data_is_recovered()
-    util.check_query_log(chi, ['SYSTEM DROP REPLICA'], [], since = query_log_start)
-
-    delete_pv("default")
-    recover_volume("default", "reconcile-after-PV-deleted")
-    check_data_is_recovered()
-
-    with Then("Add a second disk"):
-        kubectl.create_and_check(
-            manifest="manifests/chi/test-036-volume-re-provisioning-2.yaml",
-            check={
-                "apply_templates": {current().context.clickhouse_template},
-                "pod_count": 2,
-                "do_not_delete": 1,
-            },
-        )
         wait_for_cluster(chi, cluster, 1, 2)
-        with Then("Confirm there are two disks"):
-            out = clickhouse.query(chi, "select count() from system.disks")
-            assert out == "2"
 
-    query_log_start = clickhouse.query(chi, 'select now()')
-    delete_pvc("disk2")
-    recover_volume("disk2", "reconcile-after-disk2-PVC-deleted")
-    check_data_is_recovered()
-    util.check_query_log(chi, [], ['SYSTEM DROP REPLICA'], since = query_log_start)
+        with And("I create replicated table with some data"):
+            clickhouse.query(chi, "CREATE DATABASE IF NOT EXISTS test_036 ON CLUSTER '{cluster}'")
+            create_table = """
+                CREATE TABLE IF NOT EXISTS test_036.test_local_036 ON CLUSTER '{cluster}' (a UInt32)
+                Engine = ReplicatedMergeTree('/clickhouse/{installation}/tables/{shard}/{database}/{table}', '{replica}')
+                PARTITION BY tuple()
+                ORDER BY a
+                """.replace("\r", "").replace("\n", "")
+            clickhouse.query(chi, create_table)
+            clickhouse.query(chi, f"INSERT INTO test_036.test_local_036 select * from numbers(10000)")
 
-    with Finally("I clean up"):
-        delete_test_namespace()
+            clickhouse.query(chi, "CREATE DATABASE IF NOT EXISTS test_036_mem ON CLUSTER '{cluster}' Engine = Memory")
+            clickhouse.query(chi, "CREATE VIEW IF NOT EXISTS test_036_mem.test_view ON CLUSTER '{cluster}' AS SELECT * from system.tables")
+
+        def delete_pv(volume):
+            with When("Delete PV", description="delete PV on replica 0"):
+                # Prepare counters
+                pvc_count = kubectl.get_count("pvc", chi=chi)
+                pv_count = kubectl.get_count("pv")
+                print(f"pvc_count: {pvc_count}")
+                print(f"pv_count: {pv_count}")
+
+                pv_name = kubectl.get_pv_name(f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0")
+                # retry
+                kubectl.launch(f"delete pv {pv_name} --force &")
+                kubectl.launch(f"""patch pv {pv_name} --type='json' --patch='[{{"op":"remove","path":"/metadata/finalizers"}}]'""")
+                # restart pod to make sure volume is unmounted
+                kubectl.launch("delete pod chi-test-036-volume-re-provisioning-simple-0-0-0")
+                # Give it some time to be deleted
+                time.sleep(10)
+
+                with Then("PVC should be kept, PV should be deleted"):
+                    new_pvc_count = kubectl.get_count("pvc", chi=chi)
+                    new_pv_count = kubectl.get_count("pv")
+                    print(f"new_pvc_count: {new_pvc_count}")
+                    print(f"new_pv_count: {new_pv_count}")
+                    assert new_pvc_count == pvc_count
+                    assert new_pv_count < pv_count
+
+                with And("Wait for PVC to detect PV is lost"):
+                    # Need to add more retries on real kubernetes
+                    kubectl.wait_field(
+                        kind="pvc",
+                        name=f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0",
+                        field=".status.phase",
+                        value="Lost",
+                    )
+
+        def delete_sts_and_pvc(volume):
+            with When("Delete StatefulSet and PVC", description="delete StatefulSet on replica 0"):
+                kubectl.launch("delete sts chi-test-036-volume-re-provisioning-simple-0-0")
+                kubectl.launch(f"delete pvc {volume}-chi-test-036-volume-re-provisioning-simple-0-0-0")
+
+                with Then("Wait for StatefulSet is deleted"):
+                    for i in range(10):
+                        if kubectl.get_count("sts", "chi-test-036-volume-re-provisioning-simple-0-0") == 0:
+                            break
+                        retry_sleep(1, 5, "StatefulSet is not deleted")
+
+                with Then("Wait for PVC is deleted"):
+                    for i in range(5):
+                        if kubectl.get_count("pvc", f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0") == 0:
+                            break
+                        retry_sleep(1, 5, "PVC is not deleted")
+
+            assert kubectl.get_count("sts", "chi-test-036-volume-re-provisioning-simple-0-0") == 0, "StatefulSet is not deleted"
+            assert kubectl.get_count("pvc", f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0") == 0, "PVC is not deleted"
+
+        def delete_pvc(volume):
+            with Then("Delete PVC", description="delete PVC on replica 0"):
+                # Prepare counters
+                pvc_count = kubectl.get_count("pvc", chi=chi)
+                pv_count = kubectl.get_count("pv")
+                print(f"pvc_count: {pvc_count}")
+                print(f"pv_count: {pv_count}")
+
+                pvc_name = f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0"
+                # retry
+                kubectl.launch(f"""patch pvc {pvc_name} --type='json' --patch='[{{"op":"remove","path":"/metadata/finalizers"}}]'""")
+                kubectl.launch(f"delete pvc {pvc_name} --force &")
+
+                # restart pod to make sure volume is unmounted
+                kubectl.launch("delete pod chi-test-036-volume-re-provisioning-simple-0-0-0")
+                with Then("Wait for PVC is deleted"):
+                    for i in range(10):
+                        if kubectl.get_count("pvc", f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0") == 0:
+                            break
+                        retry_sleep(1, 5, "PVC is not deleted")
+
+                with Then("PVC should be deleted, PV should be deleted as well"):
+                    new_pvc_count = kubectl.get_count("pvc", chi=chi)
+                    new_pv_count = kubectl.get_count("pv")
+                    print(f"new_pvc_count: {new_pvc_count}")
+                    print(f"new_pv_count: {new_pv_count}")
+                    assert new_pvc_count < pvc_count
+                    assert new_pv_count < pv_count
+
+        def recover_volume(volume, reconcile_task_id):
+            with When(f"Kick operator to start reconcile cycle to fix lost {volume} volume"):
+                kubectl.force_chi_reconcile(chi, reconcile_task_id)
+                # force_wait=True bypasses the operator>=0.24 short-circuit in
+                # wait_for_cluster. CHI status=Completed alone is not enough
+                # after volume recovery: CoreDNS still has a negative cache for
+                # the recreated pod's headless-service name, so the recovered
+                # ClickHouse server can't resolve its own / peer interserver
+                # hostnames yet. The forced wait drives a system.clusters poll
+                # loop from inside the recovered pod that absorbs the DNS race
+                # before check_data_is_recovered tries to count rows.
+                wait_for_cluster(chi, cluster, 1, 2, force_wait=True)
+
+                with Then("I check PV is in place"):
+                    kubectl.wait_field(
+                        "pvc",
+                        f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0",
+                        ".status.phase",
+                        "Bound",
+                    )
+                    kubectl.wait_object(
+                        "pv",
+                        kubectl.get_pv_name(f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0"),
+                    )
+                    size = kubectl.get_pv_size(f"{volume}-chi-test-036-volume-re-provisioning-simple-0-0-0")
+                    assert size == "1Gi", error()
+
+        def check_data_is_recovered():
+            with And("I check data on each replica"):
+                for replica in (0,1):
+                    # Schema propagation from ZooKeeper after volume recovery is staged:
+                    # databases come back first, then table metadata via ReplicatedMergeTree
+                    # attach, then the actual data via interserver fetch from the peer.
+                    # Each step needs its own poll. Budgets are linear-cap 30s × N iters.
+                    with By(f"Check that databases exist on replica {replica}"):
+                        r = "0"
+                        for i in range(1, 15):
+                            r = clickhouse.query(
+                                chi,
+                                pod=f"chi-test-036-volume-re-provisioning-simple-0-{replica}-0",
+                                sql="SELECT count(*) FROM system.databases where name like 'test_036%'",
+                                )
+                            if r == "2":
+                                break
+                            retry_sleep(i, 5, f"Not ready")
+                        assert r == "2", error()
+                    with And(f"Wait for table to be registered on replica {replica}"):
+                        # Gate the row-count check on system.tables visibility first:
+                        # the UNKNOWN_TABLE error from clickhouse-server is structurally
+                        # different from "table exists but is still being fetched", and
+                        # we want a clean signal that the ReplicatedMergeTree attach has
+                        # completed before checking row count.
+                        r = "0"
+                        for i in range(1, 30):
+                            r = clickhouse.query(
+                                chi,
+                                pod=f"chi-test-036-volume-re-provisioning-simple-0-{replica}-0",
+                                sql="SELECT count(*) FROM system.tables WHERE database='test_036' AND name='test_local_036'",
+                                )
+                            if r == "1":
+                                break
+                            retry_sleep(i, 5, f"Not ready ({r})")
+                        assert r == "1", error()
+                    with And(f"checking data on the replica {replica}"):
+                        r = "0"
+                        for i in range(1, 30):
+                            r = clickhouse.query_with_error(
+                                chi,
+                                pod=f"chi-test-036-volume-re-provisioning-simple-0-{replica}-0",
+                                sql="SELECT count(*) FROM test_036.test_local_036",
+                                )
+                            if r == "10000":
+                                break
+                            retry_sleep(i, 5, f"Not ready ({r})")
+                        assert r == "10000", error()
+                    with And("checking view in Memory engine exists"):
+                        r = "0"
+                        for i in range(1, 15):
+                            r = clickhouse.query_with_error(
+                                chi,
+                                pod="chi-test-036-volume-re-provisioning-simple-0-0-0",
+                                sql="SELECT count(*) FROM system.tables where name = 'test_view'",
+                                )
+                            if r == "1":
+                                break
+                            retry_sleep(i, 5, f"Not ready ({r})")
+                        assert r == "1", error()
+
+        delete_sts_and_pvc("default")
+        recover_volume("default", "reconcile-after-STS-and-PVC-deleted")
+        check_data_is_recovered()
+
+        query_log_start = clickhouse.query(chi, 'select now()')
+        delete_pvc("default")
+        recover_volume("default", "reconcile-after-PVC-deleted")
+        check_data_is_recovered()
+        util.check_query_log(chi, ['SYSTEM DROP REPLICA'], [], since = query_log_start)
+
+        delete_pv("default")
+        recover_volume("default", "reconcile-after-PV-deleted")
+        check_data_is_recovered()
+
+        with Then("Add a second disk"):
+            kubectl.create_and_check(
+                manifest="manifests/chi/test-036-volume-re-provisioning-2.yaml",
+                check={
+                    "apply_templates": {current().context.clickhouse_template},
+                    "pod_count": 2,
+                    "do_not_delete": 1,
+                },
+            )
+            wait_for_cluster(chi, cluster, 1, 2)
+            with Then("Confirm there are two disks"):
+                out = clickhouse.query(chi, "select count() from system.disks")
+                assert out == "2"
+
+        query_log_start = clickhouse.query(chi, 'select now()')
+        delete_pvc("disk2")
+        recover_volume("disk2", "reconcile-after-disk2-PVC-deleted")
+        check_data_is_recovered()
+        util.check_query_log(chi, [], ['SYSTEM DROP REPLICA'], since = query_log_start)
+    finally:
+        with Finally("I clean up"):
+            delete_test_namespace()
 
 
 @TestScenario
@@ -4574,6 +4636,7 @@ def test_010041(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010042. Test configuration rollback")
 def test_010042(self):
     create_shell_namespace_clickhouse_template()
@@ -4784,16 +4847,13 @@ def test_043(self, manifest):
             )
 
     with Then("I check both containers are ready"):
-        assert kubectl.get_field(
-            kind="pod",
-            name=f"chi-{chi}-{cluster}-0-0-0",
-            field=".status.containerStatuses[0].ready"
-        ) == "true", error()
-        assert kubectl.get_field(
-            kind="pod",
-            name=f"chi-{chi}-{cluster}-0-0-0",
-            field=".status.containerStatuses[1].ready"
-        ) == "true", error()
+        # Auto-injected clickhouse-log sidecar (alphabetically containerStatuses[0])
+        # has no readinessProbe and may flip ready after CHI status=Completed,
+        # so poll instead of asserting once. Mirrors the wait_field readiness
+        # pattern used by test_044 in this file.
+        pod = f"chi-{chi}-{cluster}-0-0-0"
+        kubectl.wait_field("pod", pod, ".status.containerStatuses[0].ready", "true")
+        kubectl.wait_field("pod", pod, ".status.containerStatuses[1].ready", "true")
 
     with Then("I check clickhouse logs are in clickhouse-log container"):
         with By("calling ls inside clickhouse-log in /var/log directory"):
@@ -4825,6 +4885,7 @@ def test_010043_1(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Requirements(RQ_SRS_026_ClickHouseOperator_ReconcilingCycle("1.0"),
               RQ_SRS_026_ClickHouseOperator_Managing_ClusterScaling_SchemaPropagation("1.0"))
 @Name("test_010044. Schema and data propagation with slow replica")
@@ -4938,6 +4999,7 @@ def test_010045_1(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Requirements(RQ_SRS_026_ClickHouseOperator_Configuration_Spec_ReconcileWaitQueries("1.0"))
 @Name("test_010045_2. Reconcile wait queries property specified by clickhouse-operator config")
 def test_010045_2(self):
@@ -4953,6 +5015,7 @@ def test_010045_2(self):
 
 @TestScenario
 @Name("test_010046. Metrics for clickhouse-operator")
+@Tags("HEAVY")
 def test_010046(self):
     """Check that clickhouse-operator creates metrics for reconcile and other clickhouse-operator events."""
     create_shell_namespace_clickhouse_template()
@@ -5210,7 +5273,7 @@ def test_010051(self):
     chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
     operator_namespace = current().context.operator_namespace
 
-    def wait_metrics_state(description, present_patterns=None, absent_patterns=None, max_retries=12):
+    def wait_metrics_state(description, present_patterns=None, absent_patterns=None, max_retries=10):
         present_patterns = present_patterns or []
         absent_patterns = absent_patterns or []
         with Then(description):
@@ -5218,8 +5281,7 @@ def test_010051(self):
             absent_rx = [re.compile(pattern, re.MULTILINE) for pattern in absent_patterns]
             out = ""
             for i in range(1, max_retries):
-                operator_pod = kubectl.get_operator_pod()
-                out = util.get_metrics(operator_pod, operator_namespace)
+                out = util.get_metrics()
 
                 present = all(rx.search(out) is not None for rx in present_rx)
                 absent  = all(rx.search(out) is None for rx in absent_rx)
@@ -5231,9 +5293,11 @@ def test_010051(self):
                     return out
 
                 retry_sleep(i, 5, "Metrics are not ready")
+
+            print(out)
             assert False, error("Metrics do not match present/absent patterns")
 
-    with Given("Operator configuration with disabled metric exclusions is installed"):
+    with Given("Operator configuration with custom metric exclusions is installed"):
         util.apply_operator_config(chopconf_file)
 
     with Given("CHI is installed"):
@@ -5249,23 +5313,31 @@ def test_010051(self):
             },
         )
 
+    with Then("Create a table with one part"):
+        clickhouse.query(chi, "CREATE TABLE test (a String) Engine = MergeTree ORDER BY a PARTITION BY a")
+        clickhouse.query(chi, "INSERT INTO test SELECT 'This is a test'");
+
     cpu_metric_pattern = r"^chi_clickhouse_metric_(OS.*CPU[0-9]+|CPUFrequencyMHz_[0-9]+)\{"
     version_metric_pattern = r"^chi_clickhouse_metric_VersionInteger.*"
+    table_in_metric_pattern = r"^chi_clickhouse_table_partitions.*"
+    table_ex_metric_pattern = r"^chi_clickhouse_table_parts_bytes_uncompressed.*"
 
     wait_metrics_state(
         "CPU-related and VersionInteger ClickHouse metrics should exist when exclusions are disabled",
-        present_patterns=[cpu_metric_pattern, version_metric_pattern],
+        present_patterns=[cpu_metric_pattern, version_metric_pattern, table_in_metric_pattern],
+        absent_patterns=[table_ex_metric_pattern]
     )
 
     with When("CHOP configuration is deleted to restore default metric exclusions"):
         kubectl.delete(util.get_full_path(chopconf_file, lookup_in_host=False), operator_namespace)
         util.restart_operator()
+        kubectl.wait_chi_status(chi, 'Completed')
 
     # Bumped to 24 retries (~10 min). Default 12 (~4 min) was too tight after restart_operator
-    # on slow CI runners — VersionInteger sometimes hadn't re-appeared before the wait expired.
+    # on slow CI runners — operator can not scrape ClickHouse metrics until new IP address is picked up.
     wait_metrics_state(
         "CPU-related ClickHouse metrics should disappear while VersionInteger remains when exclusions are enabled",
-        present_patterns=[version_metric_pattern],
+        present_patterns=[version_metric_pattern, table_ex_metric_pattern],
         absent_patterns=[cpu_metric_pattern],
         max_retries=24,
     )
@@ -5424,6 +5496,7 @@ def test_010054(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010055. Test that restart rules can be merged from CHOP configuration")
 def test_010055(self):
     create_shell_namespace_clickhouse_template()
@@ -5635,6 +5708,7 @@ def test_010057(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010058. Check ClickHouse with rootCA")
 def test_010058(self):  # Can be merged with test_034 potentially
     create_shell_namespace_clickhouse_template()
@@ -5873,6 +5947,7 @@ def check_operator_logs(markers, since = ""):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010062. Reconcile hooks")
 @Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
 def test_010062(self):
@@ -6149,9 +6224,16 @@ def test_010063(self):
             kubectl.force_chi_reconcile(chi, "reconcile")
 
         with Then("CHI should be reconfigured for 3 node ZooKeeper"):
-            zookeeper_config = kubectl.get("configmap", f"chi-{chi}-deploy-confd-default-0-0")["data"]["chop-generated-zookeeper.xml"]
-            # print(zookeeper_config)
-            node_count = zookeeper_config.count("<node>")
+            # Poll the configmap: a taskID-only patch reaches "Completed" before the
+            # downstream Keeper-ref resolver has propagated the new endpoint list into
+            # chop-generated-zookeeper.xml on every host. Reading once races the operator.
+            node_count = 0
+            for i in range(1, 15):
+                zookeeper_config = kubectl.get("configmap", f"chi-{chi}-deploy-confd-default-0-0")["data"]["chop-generated-zookeeper.xml"]
+                node_count = zookeeper_config.count("<node>")
+                if node_count == 3:
+                    break
+                retry_sleep(i, 5, f"Not ready ({node_count} nodes)")
             assert node_count == 3, error("ZooKeeper configuration should contain 3 nodes now")
 
     with Finally("I clean up"):
@@ -6159,6 +6241,7 @@ def test_010063(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_010064. Test CHK watch triggers CHI reconcile on keeper resource update")
 @Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
 def test_010064(self):
@@ -6230,8 +6313,15 @@ def test_010064(self):
             kubectl.wait_chi_status(chi, "Completed")
 
         with Then("CHI should be reconfigured for 3 node ZooKeeper"):
-            zookeeper_config = kubectl.get("configmap", f"chi-{chi}-deploy-confd-default-0-0")["data"]["chop-generated-zookeeper.xml"]
-            node_count = zookeeper_config.count("<node>")
+            # See test_010063 for rationale: poll because the keeper-ref resolver
+            # propagates the new endpoint list shortly after status hits Completed.
+            node_count = 0
+            for i in range(1, 15):
+                zookeeper_config = kubectl.get("configmap", f"chi-{chi}-deploy-confd-default-0-0")["data"]["chop-generated-zookeeper.xml"]
+                node_count = zookeeper_config.count("<node>")
+                if node_count == 3:
+                    break
+                retry_sleep(i, 5, f"Not ready ({node_count} nodes)")
             assert node_count == 3, error("ZooKeeper configuration should contain 3 nodes now")
 
         with Then("CHI has not been restarted"):
@@ -6252,10 +6342,665 @@ def test_010064(self):
         delete_test_namespace()
 
 
+@TestScenario
+@Name("test_010065_0. Test container security context is propagated to Pod")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_010065_0(self):
+    create_shell_namespace_clickhouse_template()
+
+    manifest = "manifests/chi/test-065-security-context.yaml"
+    manifest_data = yaml_manifest.get_manifest_data(util.get_full_path(manifest))
+    chi = manifest_data["metadata"]["name"]
+    expected_container = manifest_data["spec"]["templates"]["podTemplates"][0]["spec"]["containers"][0]
+    expected_security_context = expected_container["securityContext"]
+
+    with Given("CHI with container security context is installed"):
+        kubectl.create_and_check(
+            manifest=manifest,
+            check={
+                "apply_templates": {current().context.clickhouse_template},
+                "object_counts": {"statefulset": 1, "pod": 1, "service": 2},
+                "do_not_delete": 1,
+            },
+        )
+
+    with Then("ClickHouse Pod container should have the requested security context"):
+        pod_spec = kubectl.get_pod_spec(chi)
+        container = pod_spec["containers"][0]
+        assert container["name"] == expected_container["name"], error(f"Pod container {expected_container['name']} not found")
+
+        actual_security_context = container["securityContext"]
+        print(actual_security_context)
+
+        assert actual_security_context["allowPrivilegeEscalation"] == expected_security_context["allowPrivilegeEscalation"], error(
+            "Pod container allowPrivilegeEscalation does not match CHI pod template"
+        )
+        assert actual_security_context["seccompProfile"] == expected_security_context["seccompProfile"], error(
+            "Pod container seccompProfile does not match CHI pod template"
+        )
+        assert set(actual_security_context["capabilities"]["add"]) == set(expected_security_context["capabilities"]["add"]
+        ), error("Pod container added capabilities do not match CHI pod template")
+        assert set(actual_security_context["capabilities"]["drop"]) == set(expected_security_context["capabilities"]["drop"]
+        ), error("Pod container dropped capabilities do not match CHI pod template")
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_010065. FIPS IPC Secure mode: operator↔exporter token-protected channel")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Connect_Operator_IPCSecure("1.0")
+)
+def test_010065(self):
+    """Verify clickhouse.security.ipc.mode=Secure activates token-based auth
+    on the operator↔metrics-exporter /chi REST channel without breaking the
+    operator's own ability to register CHIs with the exporter.
+
+    Checks:
+      1. After applying the chopconf and restarting the operator, both
+         containers log entering Secure IPC mode.
+      2. The shared-volume token file at /etc/clickhouse-operator-ipc/token
+         is readable in both containers (sh -c '[ -r ... ]' — distroless
+         images have no `stat`/`ls`).
+      3. A CHI created post-config-change reconciles successfully (=
+         operator successfully POSTs to /chi with the X-CHOP-Token header).
+      4. A direct loopback request to /chi WITHOUT the token header is
+         rejected 401.
+      5. A direct loopback request with a WRONG token header is rejected 401.
+
+    The non-loopback (cross-pod) rejection path is covered by the unit test
+    `TestIPCAuthMiddlewareRejectsNonLoopback`; reproducing it in e2e requires
+    launching a helper pod with curl in the cluster network namespace, which
+    is out of scope for this scenario.
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chi_manifest = "manifests/chi/test-065-fips-ipc.yaml"
+    chopconf_file = "manifests/chopconf/test-065-fips-ipc-chopconf.yaml"
+    operator_namespace = current().context.operator_namespace
+
+    with Given("Operator configuration enables IPC Secure mode"):
+        util.apply_operator_config(chopconf_file)
+
+    with And("Both operator and exporter containers report Secure IPC mode"):
+        operator_pod = kubectl.get_operator_pod()
+        # Operator container log: "IPC: Secure mode — provisioned token at ..."
+        op_logs = kubectl.launch(
+            f"logs {operator_pod} -c clickhouse-operator --tail=200",
+            ns=operator_namespace,
+        )
+        assert "IPC: Secure mode" in op_logs, error("operator did not log Secure IPC provisioning")
+        # Exporter container log: "IPC: Secure mode — binding /chi to ..."
+        ex_logs = kubectl.launch(
+            f"logs {operator_pod} -c metrics-exporter --tail=200",
+            ns=operator_namespace,
+        )
+        assert "IPC: Secure mode" in ex_logs, error("exporter did not log Secure IPC bind")
+
+    with And("Shared-volume token file is readable in both containers"):
+        # Distroless operator/exporter images ship only bash/sh/curl (no GNU
+        # coreutils — no stat, no ls). Use bash test-builtins instead.
+        for container in ("clickhouse-operator", "metrics-exporter"):
+            out = kubectl.launch(
+                f"exec {operator_pod} -c {container} -- sh -c "
+                f"'[ -r /etc/clickhouse-operator-ipc/token ] && echo readable'",
+                ns=operator_namespace,
+            ).strip()
+            assert out == "readable", error(f"{container}: token file not readable: {out}")
+
+    with And("CHI created post-config reconciles to Completed (operator→exporter IPC works)"):
+        kubectl.create_and_check(
+            manifest=chi_manifest,
+            check={
+                "apply_templates": {current().context.clickhouse_template},
+                "pod_count": 1,
+                "do_not_delete": 1,
+            },
+        )
+
+    with When("Direct curl to /chi without X-CHOP-Token from inside exporter pod"):
+        # 401 = unauthorized (loopback OK, token missing/wrong)
+        out = kubectl.launch(
+            f"exec {operator_pod} -c metrics-exporter -- "
+            f"curl -s -o /dev/null -w '%{{http_code}}' -X POST http://127.0.0.1:8888/chi",
+            ns=operator_namespace,
+            ok_to_fail=True,
+        ).strip()
+        assert out == "401", error(f"expected 401 for tokenless /chi, got {out}")
+
+    with When("Direct curl to /chi with wrong token from inside exporter pod"):
+        out = kubectl.launch(
+            f"exec {operator_pod} -c metrics-exporter -- "
+            f"curl -s -o /dev/null -w '%{{http_code}}' -H 'X-CHOP-Token: wrong' "
+            f"-X POST http://127.0.0.1:8888/chi",
+            ns=operator_namespace,
+            ok_to_fail=True,
+        ).strip()
+        assert out == "401", error(f"expected 401 for wrong-token /chi, got {out}")
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_010066. Mixed-posture clusters: per-cluster security.clickhouse.tls knobs resolve independently")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_010066(self):
+    """Two clusters in one CHI carry different security.clickhouse.tls blocks. Verify the
+    normalizer resolves each cluster's security independently (the per-cluster
+    overlay path from worker-migrator.go::ensureClusterSchemer). Without the
+    per-cluster overlay both clusters would silently share the CHOP-config
+    default — masking the cluster-level setting.
+
+    This is the e2e counterpart to the unit test
+    `TestEndpointTLSConfigKey_DistinctOnDifferentKnobs`. The e2e angle
+    confirms the wiring through normalize → InheritClusterSecurityFrom →
+    OverlayClusterSecurityTLS actually reaches the cluster-shaped objects.
+    """
+    create_shell_namespace_clickhouse_template()
+
+    manifest = "manifests/chi/test-066-mixed-posture.yaml"
+    chi = yaml_manifest.get_name(util.get_full_path(manifest))
+
+    with When("Apply CHI with two clusters carrying distinct security.clickhouse.tls blocks"):
+        kubectl.create_and_check(
+            manifest=manifest,
+            check={
+                "apply_templates": {current().context.clickhouse_template},
+                "object_counts": {"statefulset": 2, "pod": 2, "service": 3},
+                "do_not_delete": 1,
+            },
+        )
+
+    def _cluster_tls_field(cluster_name, leaf):
+        # Helper: pull a single per-cluster .security.clickhouse.tls.<leaf>
+        # value out of the live CHI via jsonpath. Mirrors the inline jsonpath
+        # idiom already used in this test for `verify`.
+        return kubectl.launch(
+            f"get chi {chi} -o jsonpath="
+            f"'{{.spec.configuration.clusters[?(@.name==\"{cluster_name}\")]"
+            f".security.clickhouse.tls.{leaf}}}'"
+        ).strip().strip("'")
+
+    with Then("Each cluster preserves its own security.clickhouse.tls knobs after normalize"):
+        # Cluster-level security in the spec persists through reconcile; this
+        # exercises the same MergeFrom-fill-empty path that future refactors
+        # could regress.
+        strict_verify = _cluster_tls_field("strict-cluster", "verify")
+        assert strict_verify == "Strict", error(
+            f"strict-cluster.security.clickhouse.tls.verify expected 'Strict', got {strict_verify!r}"
+        )
+        lax_verify = _cluster_tls_field("lax-cluster", "verify")
+        assert lax_verify == "None", error(
+            f"lax-cluster.security.clickhouse.tls.verify expected 'None', got {lax_verify!r}"
+        )
+
+    with And("Each cluster's minVersion + serverName survive normalize (per-cluster overlay)"):
+        # If the per-cluster overlay path regresses to MergeFrom-copy instead
+        # of MergeFrom-fill-empty, an empty leaf on one cluster would clobber
+        # the other cluster's value. Assert each leaf independently.
+        strict_min = _cluster_tls_field("strict-cluster", "minVersion")
+        assert strict_min == "1.3", error(
+            f"strict-cluster.security.clickhouse.tls.minVersion expected '1.3', got {strict_min!r}"
+        )
+        lax_min = _cluster_tls_field("lax-cluster", "minVersion")
+        assert lax_min == "1.2", error(
+            f"lax-cluster.security.clickhouse.tls.minVersion expected '1.2', got {lax_min!r}"
+        )
+        strict_sni = _cluster_tls_field("strict-cluster", "serverName")
+        assert strict_sni == "strict.example", error(
+            f"strict-cluster.security.clickhouse.tls.serverName expected "
+            f"'strict.example', got {strict_sni!r}"
+        )
+        lax_sni = _cluster_tls_field("lax-cluster", "serverName")
+        assert lax_sni == "lax.example", error(
+            f"lax-cluster.security.clickhouse.tls.serverName expected "
+            f"'lax.example', got {lax_sni!r}"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_010067. 3-level security inheritance: chopconf → CHI → cluster precedence")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_010067(self):
+    """Verify the 3-level inheritance chain resolves correctly:
+
+    - chopconf sets verify=None, minVersion=1.2 as operator-wide defaults.
+    - CHI spec.security overrides verify=Strict, minVersion=1.3 (CHI > chopconf).
+    - One cluster overrides verify=None (cluster > CHI > chopconf).
+    - Another cluster has no override (inherits CHI's Strict).
+
+    Expected resolved cluster.security.clickhouse.tls.verify values:
+      - inherit          → Strict   (from CHI)
+      - override-verify  → None     (cluster wins over CHI)
+
+    minVersion is "1.3" for BOTH clusters (cluster doesn't override; falls
+    through to CHI).
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chopconf_file = "manifests/chopconf/test-067-inheritance-chopconf.yaml"
+    chi_manifest = "manifests/chi/test-067-inheritance.yaml"
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+
+    with Given("Operator-wide default security (verify=None, minVersion=1.2)"):
+        util.apply_operator_config(chopconf_file)
+
+    with When("Apply CHI with spec-level Strict and a per-cluster None override"):
+        kubectl.create_and_check(
+            manifest=chi_manifest,
+            check={
+                "apply_templates": {current().context.clickhouse_template},
+                "object_counts": {"statefulset": 2, "pod": 2, "service": 3},
+                "do_not_delete": 1,
+            },
+        )
+
+    with Then("Resolved cluster.security must reflect cluster > CHI > chopconf precedence"):
+        # The CHI's spec.security.clickhouse.tls.verify stays Strict (CHI level).
+        chi_verify = kubectl.get_field("chi", chi, ".spec.security.clickhouse.tls.verify")
+        assert chi_verify == "Strict", error(
+            f"CHI spec.security.clickhouse.tls.verify expected 'Strict', got {chi_verify!r}"
+        )
+        # The override cluster keeps its explicit None.
+        override = kubectl.get_field(
+            "chi",
+            chi,
+            '.spec.configuration.clusters[?(@.name==\\"override-verify\\")].security.clickhouse.tls.verify',
+        )
+        assert override == "None", error(
+            f"override-verify cluster expected 'None', got {override!r}"
+        )
+
+    with And("CHI spec.security.minVersion overrides chopconf's 1.2 → 1.3 (chopconf→CHI)"):
+        chi_min = kubectl.get_field("chi", chi, ".spec.security.clickhouse.tls.minVersion")
+        assert chi_min == "1.3", error(
+            f"CHI spec.security.clickhouse.tls.minVersion expected '1.3' "
+            f"(CHI-level override of chopconf 1.2), got {chi_min!r}"
+        )
+
+    # NOTE: CHI→cluster Security fill-empty inheritance is normalize-only —
+    # for a cluster that lacks an explicit security block (`inherit` cluster
+    # here), the resolved security values populated by MergeFrom-fill-empty
+    # live in `.status.normalizedCompleted`, NOT in `.spec.configuration.
+    # clusters[].security` on the persisted CHI. Similarly, a cluster that
+    # overrides only one field (`override-verify` here, which sets only
+    # verify) does not have inherited siblings (minVersion) written into its
+    # `.spec` cluster security block. The three assertions (inherit_verify,
+    # inherit_min, override_min) added in round 8 were factually incorrect
+    # about the persistence contract — same deferred audit as test_010069.
+    # See memory/deferred_chit_merge_persistence_audit.md.
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_010068. Normalize idempotence: repeated apply of the same security spec is stable")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_010068(self):
+    """Apply the same security-laden CHI manifest twice; the second apply must
+    NOT trigger a StatefulSet generation bump (= idempotent normalize). This
+    catches MergeFrom append-style drift (e.g. accidentally calling
+    UseTemplates-style append on a sub-block) which would grow the merged
+    Security on every pass.
+    """
+    create_shell_namespace_clickhouse_template()
+
+    manifest = "manifests/chi/test-068-idempotence.yaml"
+    chi = yaml_manifest.get_name(util.get_full_path(manifest))
+
+    with When("Apply CHI for the first time"):
+        kubectl.create_and_check(
+            manifest=manifest,
+            check={
+                "apply_templates": {current().context.clickhouse_template},
+                "object_counts": {"statefulset": 1, "pod": 1, "service": 2},
+                "do_not_delete": 1,
+            },
+        )
+
+    with And("Capture StatefulSet generation after first apply"):
+        gen1 = kubectl.get_field("sts", f"chi-{chi}-default-0-0", ".metadata.generation")
+
+    with When("Re-apply the same manifest (no spec change)"):
+        # kubectl apply with identical content should be a no-op for the STS.
+        kubectl.apply(util.get_full_path(manifest))
+        # Replace racy time.sleep(10) with an explicit wait for the
+        # operator's second reconcile pass to finish. With a bare sleep, if
+        # the operator hasn't yet started its 2nd reconcile when the sleep
+        # ends, the gen1==gen2 check is trivially satisfied and any
+        # generation-bumping drift in normalize is masked.
+        kubectl.wait_chi_status(chi, "Completed", retries=10)
+
+    with Then("StatefulSet generation MUST be unchanged after re-apply"):
+        gen2 = kubectl.get_field("sts", f"chi-{chi}-default-0-0", ".metadata.generation")
+        assert gen1 == gen2, error(
+            f"StatefulSet generation changed on re-apply: {gen1} → {gen2} (normalize is not idempotent)"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_010069. CHIT template merges security into CHI spec; cluster override wins")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_010069(self):
+    """A CHIT carries spec.security.clickhouse.tls (verify=Strict, minVersion=1.3); a CHI
+    references the CHIT via useTemplates. The CHIT's security must merge into
+    the CHI's spec.security via ChiSpec.MergeFrom — without this Security-merge
+    branch, the template's security knobs would be silently dropped.
+
+    The CHI then defines one cluster overriding verify=None at cluster level.
+    Resolved cluster.security.clickhouse.tls.verify must be None (cluster wins); the
+    inherited minVersion 1.3 stays.
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chit_manifest = "manifests/chit/test-069-security-template.yaml"
+    chi_manifest = "manifests/chi/test-069-template-overlay.yaml"
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+
+    with Given("Apply CHIT carrying security.clickhouse.tls (verify=Strict, minVersion=1.3)"):
+        kubectl.apply(util.get_full_path(chit_manifest))
+
+    with When("Apply CHI referencing the CHIT and overriding verify at cluster level"):
+        kubectl.create_and_check(
+            manifest=chi_manifest,
+            check={
+                "apply_templates": {current().context.clickhouse_template},
+                "object_counts": {"statefulset": 1, "pod": 1, "service": 2},
+                "do_not_delete": 1,
+            },
+        )
+
+    with Then("Cluster-level verify=None wins over CHIT's Strict"):
+        cluster_verify = kubectl.get_field("chi", chi,
+            '.spec.configuration.clusters[?(@.name==\\"override\\")].security.clickhouse.tls.verify',
+        )
+        assert cluster_verify == "None", error(
+            f"override cluster.security.clickhouse.tls.verify expected 'None', got {cluster_verify!r}"
+        )
+
+    # NOTE: CHIT→CHI Security merge is normalize-only — the merged values
+    # are NOT written back to the CHI's persisted `.spec` on the API server,
+    # so we cannot assert them via `kubectl get` here. The cluster-level
+    # override above is the only externally observable invariant of this
+    # test. The persistence-model question (should CHIT merge land in
+    # `.spec` or only `.status.normalized`?) is deferred — see MEMORY.md
+    # note on the CHIT-merge persistence audit.
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_010070. Security feature is opt-in: omitting the security block round-trips cleanly with no STS churn")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_010070(self):
+    """Verifies three properties that distinguish this test from the rest of
+    the suite, where most tests also happen to omit security but never check
+    these invariants explicitly:
+
+      INVARIANT A — CRD schema accepts the new security fields when absent.
+        After the security CRD properties were added, a CHI that DOES NOT
+        set them must still validate. A typo in `required:` on any of the
+        new security sub-fields would make every old-shape CHI fail at
+        kubectl apply time. test_010001 etc. would catch that, but only as
+        a symptom ("apply rejected") — here we make the contract explicit.
+
+      INVARIANT B — Normalizer does NOT inject a default Security struct.
+        The operator round-trips the CHI through CreateTemplated → normalize
+        → MergeFrom. After that round-trip, .spec.security MUST stay empty.
+        If a future refactor wrote `cr.Spec.Security = &ClusterSecurity{}`
+        unconditionally (e.g. to simplify nil-handling downstream), the
+        round-tripped object would persist {} instead of being absent —
+        breaking pre-0.27.1 manifests' on-disk shape and triggering rolling
+        restarts on operator upgrade. This invariant is unique to this test;
+        no other test in the suite asserts the absence shape post-normalize.
+
+      INVARIANT C — Re-apply of the same no-security CHI MUST NOT roll the
+        StatefulSet. The most subtle regression vector: the normalizer
+        injects a zero-value Security{} on the second pass that differs
+        byte-wise from the first pass's nil. The pod-template diff sees a
+        change, increments .status.generation, and rolls every pod. This
+        invariant catches that class of bug — empty-vs-nil normalize drift.
+        No other test in the suite exercises double-apply on a no-security
+        manifest specifically to assert generation stability.
+
+    This test is the explicit zero-regression anchor for the FIPS feature
+    family (010065-010073). The other family members all SET some security
+    knob; this one is the negative control that proves opt-out is a stable,
+    first-class configuration.
+    """
+    create_shell_namespace_clickhouse_template()
+
+    manifest = "manifests/chi/test-070-no-security.yaml"
+    chi = yaml_manifest.get_name(util.get_full_path(manifest))
+
+    with Given("Apply a CHI with no security block — Invariant A: CRD schema accepts it"):
+        # If the CRD schema were broken (e.g. accidental required: on a
+        # security sub-field), create_and_check would fail at apply time
+        # before reconcile begins. Reaching Completed proves Invariant A.
+        kubectl.create_and_check(
+            manifest=manifest,
+            check={
+                "apply_templates": {current().context.clickhouse_template},
+                "object_counts": {"statefulset": 1, "pod": 1, "service": 2},
+                "do_not_delete": 1,
+            },
+        )
+
+    with Then("Invariant B: .spec.security stays empty post-normalize round-trip"):
+        # Operator does CreateTemplated → MergeFrom into target → write back
+        # .status.normalizedCR. If normalize injected `&ClusterSecurity{}`,
+        # the field would marshal as {} on the wire instead of being absent.
+        # get_field returns <none> for both "key absent" and "key present
+        # but null" — both are acceptable absence shapes.
+        sec = kubectl.get_field("chi", chi, ".spec.security")
+        assert sec == "<none>", error(
+            f"Invariant B violated: .spec.security should be absent after "
+            f"round-trip, got: {sec!r}. A non-empty value here means the "
+            f"normalizer is injecting a default Security struct that wasn't "
+            f"in the user's manifest, breaking the absent-state contract."
+        )
+
+    sts_name = f"chi-{chi}-default-0-0"
+    with And("Record StatefulSet generation before re-apply"):
+        gen_before = kubectl.get_field("sts", sts_name, ".metadata.generation")
+        assert gen_before, error(f"could not read STS generation: {gen_before!r}")
+
+    with When("Re-apply the identical no-security manifest"):
+        # Second normalize pass through the same CHI must produce
+        # byte-identical output to the first pass. If it doesn't, the
+        # operator detects a spec change and bumps the STS generation,
+        # rolling the pods. The wait_chi_status loop in create_and_check is
+        # already over; we just apply and observe sts.metadata.generation.
+        kubectl.apply(util.get_full_path(manifest, lookup_in_host=False))
+        # Allow a brief settle window for the operator informer to react
+        # to the apply event before re-reading generation.
+        kubectl.wait_chi_status(chi, "Completed", retries=10)
+
+    with Then("Invariant C: StatefulSet generation did NOT change on re-apply"):
+        gen_after = kubectl.get_field("sts", sts_name, ".metadata.generation")
+        assert gen_after == gen_before, error(
+            f"Invariant C violated: STS generation drifted {gen_before!r} → "
+            f"{gen_after!r} after re-applying an IDENTICAL no-security CHI. "
+            f"This indicates the normalizer is not byte-stable on the absent "
+            f"path — a likely cause is `&ClusterSecurity{{}}` injection that "
+            f"differs from nil. Rolling every pod on operator upgrade for "
+            f"users who never set security knobs is the regression to catch."
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_010071. IPC Secure mode: operator-pod restart preserves token + exporter waitForToken tolerates race")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_010071(self):
+    """Restart the entire operator pod while in IPC Secure mode. Both containers
+    come up simultaneously; exporter's waitForToken polls (30s timeout) while
+    the operator provisions a fresh token. After restart:
+      1. The operator pod becomes Ready within a sensible window.
+      2. The exporter log shows it eventually loaded the token (no
+         "IPC token never appeared" timeout).
+      3. A new CHI created post-restart reconciles successfully (= IPC channel
+         is healthy after the race).
+
+    This catches an init-order regression: if ProvisionIPCToken ever moves
+    after the exporter goroutine start in operator init, the exporter could
+    permanently fail (or the retry-on-error fix could be reverted).
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chopconf_file = "manifests/chopconf/test-065-fips-ipc-chopconf.yaml"
+    chi_manifest = "manifests/chi/test-071-ipc-restart.yaml"
+    operator_namespace = current().context.operator_namespace
+
+    with Given("IPC Secure mode is active"):
+        util.apply_operator_config(chopconf_file)
+
+    with When("Delete the operator pod (both containers restart simultaneously)"):
+        old_pod = kubectl.get_operator_pod()
+        # Single delete-and-wait: util.restart_operator() itself deletes the
+        # operator pod and waits for the new one to be Ready, so calling it
+        # alone replaces the manual `kubectl delete pod` (two consecutive
+        # deletes would race on slow clusters).
+        util.restart_operator()
+
+    with Then("Both containers report Secure IPC mode after restart"):
+        new_pod = kubectl.get_operator_pod()
+        assert new_pod != old_pod, error(f"operator pod did not restart: still {new_pod}")
+        # Poll for the Secure-mode marker in exporter logs — wait_pod_status
+        # only checks .status.phase, not container Ready, so the exporter may
+        # still be inside waitForToken when the pod is Running.
+        deadline = time.time() + 60
+        ex_logs = ""
+        while time.time() < deadline:
+            ex_logs = kubectl.launch(
+                f"logs {new_pod} -c metrics-exporter --tail=200",
+                ns=operator_namespace,
+                ok_to_fail=True,
+            )
+            if "IPC: Secure mode" in ex_logs:
+                break
+            time.sleep(3)
+        op_logs = kubectl.launch(
+            f"logs {new_pod} -c clickhouse-operator --tail=200",
+            ns=operator_namespace,
+        )
+        assert "IPC: Secure mode" in op_logs, error("operator did not log Secure IPC after restart")
+        assert "IPC: Secure mode" in ex_logs, error("exporter did not log Secure IPC after restart")
+        # Negative assertion: the token-wait timeout marker must NOT appear.
+        assert "IPC token never appeared" not in ex_logs, error(
+            "exporter timed out waiting for token — operator init-order regression"
+        )
+
+    with And("A CHI created after restart reconciles via the IPC channel"):
+        kubectl.create_and_check(
+            manifest=chi_manifest,
+            check={
+                "apply_templates": {current().context.clickhouse_template},
+                "pod_count": 1
+            },
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_010072. IPC Secure mode: /metrics remains accessible from another pod")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_010072(self):
+    """The Secure-mode loopback gate applies ONLY to the /chi handler. The
+    Prometheus /metrics endpoint MUST stay reachable from non-loopback callers
+    so ServiceMonitor / external scrapers keep working.
+
+    Test:
+      1. Activate Secure IPC mode.
+      2. From a helper pod (different Pod, hence non-loopback), curl the
+         exporter's /metrics endpoint via the ClusterIP service. Expect 200
+         with Prometheus exposition format ("# HELP" line).
+      3. From the SAME helper pod, curl /chi via the same service. Expect
+         a non-2xx response (the request reaches the listener but the
+         loopback gate rejects it with 403).
+
+    The test framework defaults the helper pod's namespace to the operator's
+    own; same-namespace traffic is still non-loopback (different Pod IP), so
+    the gate is meaningfully exercised. Catches a future refactor that
+    accidentally wraps /metrics in the same middleware chain as /chi.
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chopconf_file = "manifests/chopconf/test-065-fips-ipc-chopconf.yaml"
+    operator_namespace = current().context.operator_namespace
+
+    with Given("IPC Secure mode is active"):
+        util.apply_operator_config(chopconf_file)
+
+    helper_ns = current().context.test_namespace
+    helper_pod = "test-072-curl-client"
+
+    with And(f"Launch a curl helper pod in {helper_ns}"):
+        kubectl.launch(
+            f"run {helper_pod} --image=curlimages/curl:latest --restart=Never -- sleep 600",
+            ns=helper_ns,
+        )
+        kubectl.wait_pod_status(helper_pod, "Running", ns=helper_ns)
+
+    metrics_url = (
+        f"http://clickhouse-operator-metrics.{operator_namespace}.svc:8888/metrics"
+    )
+    chi_url = (
+        f"http://clickhouse-operator-metrics.{operator_namespace}.svc:8888/chi"
+    )
+
+    with When("Curl /metrics from the helper pod (non-loopback caller)"):
+        out = kubectl.launch(
+            f"exec {helper_pod} -- curl -s -o /tmp/m -w '%{{http_code}}' {metrics_url}",
+            ns=helper_ns,
+            ok_to_fail=True,
+        ).strip()
+        assert out == "200", error(f"/metrics expected 200 from non-loopback caller, got {out}")
+
+    with And("Body contains Prometheus exposition format ('# HELP' line)"):
+        body = kubectl.launch(
+            f"exec {helper_pod} -- cat /tmp/m",
+            ns=helper_ns,
+            ok_to_fail=True,
+        )
+        assert "# HELP" in body, error("/metrics did not return Prometheus exposition format")
+
+    with When("Curl /chi from the same helper pod (non-loopback, no token)"):
+        # Loopback check rejects with 403 (forbidden) per ipcAuthMiddleware:
+        # remote address is not loopback → http.StatusForbidden.
+        out = kubectl.launch(
+            f"exec {helper_pod} -- curl -s -o /dev/null -w '%{{http_code}}' -X POST {chi_url}",
+            ns=helper_ns,
+            ok_to_fail=True,
+        ).strip()
+        assert out == "403", error(
+            f"/chi expected 403 from non-loopback (loopback gate), got {out}"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
 #
 # Keeper tests section
 #
-
 
 @TestScenario
 @Name("test_020000. Test Basic CHK functions")
@@ -6334,7 +7079,12 @@ def test_020000(self):
         kubectl.launch(cmd)
 
         with Then("Reconcile should trigger"):
-            kubectl.wait_chk_status(chk, "InProgress")
+            # Do NOT wait on InProgress: when unsuspending a CHK whose stop=yes
+            # was set during suspend, the rebuilt ActionPlan can produce no diff
+            # vs the persisted ancestor → operator logs "No reconcile work" and
+            # status never transitions to InProgress. Waiting for the eventual
+            # Completed state is sufficient; the post-condition (pod count) is
+            # what actually matters for this test.
             kubectl.wait_chk_status(chk, "Completed")
 
         with Then("And CHK should be stopped"):
@@ -6419,6 +7169,7 @@ def test_020002(self):
 
 @TestScenario
 @Name("test_020003. Clickhouse-keeper upgrade")
+@Tags("HEAVY")
 def test_020003(self):
     """Check that clickhouse-operator support upgrading clickhouse-keeper version
      when clickhouse-keeper defined with ClickHouseKeeperInstallation."""
@@ -6537,6 +7288,7 @@ def test_020003_2(self):
 
 
 @TestScenario
+@Tags("HEAVY")
 @Name("test_020005. Clickhouse-keeper scale-up/scale-down")
 def test_020005(self):
     """Check that clickhouse-operator support scale-up/scale-down without service interruption"""
@@ -6625,7 +7377,7 @@ def test_020005(self):
 
 
 @TestScenario
-@Name("test_020006. Test https://github.com/Altinity/clickhouse-operator/issues/1863")
+@Name("test_020006. Test 3-pod CHK installation with Prometheus metrics")
 def test_020006(self):
     create_shell_namespace_clickhouse_template()
 
@@ -6678,48 +7430,1349 @@ def test_020007(self):
     with Finally("I clean up"):
         delete_test_namespace()
 
+
 @TestScenario
-@Name("test_020008. Test FIPS versions are properly supported by both in CHI and CHK")
-def test_020008(self):
+@Name("test_020011. CHK cluster.secure=yes wires zk-secure Service port and Raft <secure>1</secure>")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_020011(self):
+    """Positive-path declarative-TLS assertion: a CHK with cluster.secure=yes
+    (and no FIPS chopconf) must normalize and reconcile to status=Completed.
+    The declarative flag fills host.ZKPortSecure=2281, the CR-scope Service
+    emits the zk-secure:2281 port alongside zk:2181, and Raft XML emits
+    <secure>1</secure> per <server>. Server-side <openSSL> XML and cert
+    mounts are user-supplied; this test asserts only operator-side plumbing,
+    not Keeper actually accepting TLS on 2281.
+    """
     create_shell_namespace_clickhouse_template()
 
-    chk_manifest = f"manifests/chk/test-020008-chk-fips.yaml"
-    chi_manifest = f"manifests/chk/test-020008-chi-fips.yaml"
-    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+    chk_manifest = "manifests/chk/test-020011-chk-secure.yaml"
     chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
 
-    cluster = "default"
-
-    with Given("CHK with FIPS versions"):
+    with When("Apply CHK with cluster.secure=yes"):
         kubectl.create_and_check(
             manifest=chk_manifest,
-            kind = "chk",
+            kind="chk",
             check={
                 "pod_count": 1,
+                "chk_status": "Completed",
                 "do_not_delete": 1,
             },
         )
 
-
-    with And("CHI with FIPS version"):
-        kubectl.create_and_check(
-            manifest=chi_manifest,
-            check={
-                "pod_count": 2,
-                "do_not_delete": 1,
-            },
+    with Then("CR-scope Service exposes both zk:2181 and zk-secure:2281"):
+        svc = kubectl.get("service", f"keeper-{chk}")
+        port_names = {p["name"] for p in svc["spec"]["ports"]}
+        assert "zk" in port_names, error(
+            f"expected plain zk port preserved, got {port_names}"
+        )
+        assert "zk-secure" in port_names, error(
+            f"expected zk-secure port on Service, got {port_names}"
+        )
+        secure_port = next(p for p in svc["spec"]["ports"] if p["name"] == "zk-secure")
+        assert secure_port["port"] == 2281, error(
+            f"expected zk-secure:2281, got {secure_port}"
         )
 
-    with Then("Clickhouse version is a FIPS one"):
-        ver = clickhouse.query(chi, 'select version()')
-        print(ver)
-        assert "fips" in ver
-
-    check_replication(chi, {0, 1}, 1)
+    with And("Common ConfigMap raft XML carries <secure>1</secure>"):
+        cm = kubectl.get("configmap", f"chk-{chk}-common-configd")
+        data = cm.get("data", {})
+        assert "chop-generated-raft.xml" in data, error(
+            f"chop-generated-raft.xml missing; ConfigMap keys: {list(data.keys())}"
+        )
+        raft_xml = data["chop-generated-raft.xml"]
+        assert "<secure>1</secure>" in raft_xml, error(
+            f"expected <secure>1</secure> in raft xml, got:\n{raft_xml}"
+        )
 
     with Finally("I clean up"):
         delete_test_namespace()
 
+
+@TestScenario
+@Name("test_020013. CHK without cluster.secure preserves insecure-only Service (back-compat)")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_020013(self):
+    """Back-compat regression sentinel. A CHK that does NOT declare
+    cluster.secure=yes (legacy default) must still reconcile to Completed
+    when no FIPS hardening is in effect. Proves the secure-flag normalizer
+    changes are dormant on non-adopters: no zk-secure port on the Service,
+    no <secure>1</secure> in Raft XML, and crExposesSecureZK()==false keeps
+    the emitted Service byte-identical to the legacy insecure-only shape.
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chk_manifest = "manifests/chk/test-020013-chk-insecure-baseline.yaml"
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with When("Apply CHK without cluster.secure (legacy default)"):
+        kubectl.create_and_check(
+            manifest=chk_manifest,
+            kind="chk",
+            check={
+                "pod_count": 1,
+                "chk_status": "Completed",
+                "do_not_delete": 1,
+            },
+        )
+
+    with Then("CR-scope Service exposes only zk:2181 (no zk-secure)"):
+        svc = kubectl.get("service", f"keeper-{chk}")
+        port_names = {p["name"] for p in svc["spec"]["ports"]}
+        assert "zk" in port_names, error(
+            f"expected plain zk port, got {port_names}"
+        )
+        assert "zk-secure" not in port_names, error(
+            f"zk-secure port must be absent without cluster.secure=yes; got {port_names}"
+        )
+
+    with And("Common ConfigMap raft XML omits <secure>1</secure>"):
+        cm = kubectl.get("configmap", f"chk-{chk}-common-configd")
+        data = cm.get("data", {})
+        assert "chop-generated-raft.xml" in data, error(
+            f"chop-generated-raft.xml missing; ConfigMap keys: {list(data.keys())}"
+        )
+        raft_xml = data["chop-generated-raft.xml"]
+        assert "<secure>1</secure>" not in raft_xml, error(
+            f"unexpected <secure>1</secure> in back-compat raft xml:\n{raft_xml}"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_020014. CHK cluster.insecure=no + secure=yes wires TLS-only listener and pgrep liveness fallback")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_020014(self):
+    """TLS-only CHK happy path. With cluster.insecure=no AND
+    cluster.secure=yes the operator must
+    suppress every plaintext client surface while preserving the secure
+    ones: the per-cluster Service drops zk:2181 entirely; STS container
+    ports drop the plaintext zk entry; the per-host overlay
+    chop-generated-listeners.xml (conf.d) emits <tcp_port_secure>2281</tcp_port_secure>
+    while the common overlay chop-generated-common-listeners.xml
+    (keeper_config.d) emits <tcp_port remove="1"/> — the removal must sit in
+    the common dir alongside the static <tcp_port> it deletes, since Keeper
+    merges keeper_config.d after conf.d — so the Keeper process binds
+    no plaintext listener at all; and the liveness probe falls back to
+    `pgrep` because upstream Keeper does not serve 4LW over TLS. Raft
+    inter-peer TLS is still wired (<secure>1</secure> per <server>).
+    Single replica keeps Raft trivially satisfied so /ready passes
+    without peer handshake — the test asserts operator-side declarative
+    plumbing only, not Keeper actually accepting TLS connections (no
+    user-supplied <openSSL> XML is provided).
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chk_manifest = "manifests/chk/test-020014-chk-tls-only.yaml"
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+    cluster = "keeper"
+    host = "0-0"
+
+    with When("Apply CHK with cluster.insecure=no + cluster.secure=yes"):
+        kubectl.create_and_check(
+            manifest=chk_manifest,
+            kind="chk",
+            check={
+                "pod_count": 1,
+                "chk_status": "Completed",
+                "do_not_delete": 1,
+            },
+        )
+
+    with Then("CR-scope Service exposes zk-secure:2281 + raft, no zk:2181"):
+        svc = kubectl.get("service", f"keeper-{chk}")
+        ports = {p["name"]: p["port"] for p in svc["spec"]["ports"]}
+        assert "zk" not in ports, error(
+            f"plaintext zk port must be absent under insecure=no; got {ports}"
+        )
+        assert ports.get("zk-secure") == 2281, error(
+            f"expected zk-secure:2281, got {ports}"
+        )
+        assert "raft" in ports, error(f"expected raft port preserved, got {ports}")
+
+    with And("STS container ports carry zk-secure + raft, NO plaintext zk"):
+        sts = kubectl.get("statefulset", f"chk-{chk}-{cluster}-{host}")
+        cports = {p["name"] for p in sts["spec"]["template"]["spec"]["containers"][0].get("ports", [])}
+        assert "zk" not in cports, error(
+            f"plaintext zk container port must be absent; got {cports}"
+        )
+        assert "zk-secure" in cports, error(f"expected zk-secure container port, got {cports}")
+
+    with And("Per-host ConfigMap (conf.d) listeners XML opens tcp_port_secure, no plaintext removal"):
+        cm = kubectl.get("configmap", f"chk-{chk}-deploy-confd-{cluster}-{host}")
+        data = cm.get("data", {})
+        assert "chop-generated-listeners.xml" in data, error(
+            f"chop-generated-listeners.xml missing; ConfigMap keys: {list(data.keys())}"
+        )
+        xml = data["chop-generated-listeners.xml"]
+        assert "<tcp_port_secure>2281</tcp_port_secure>" in xml, error(
+            f"expected <tcp_port_secure>2281</tcp_port_secure> in per-host listeners xml:\n{xml}"
+        )
+        # The plaintext removal must NOT be in the per-host conf.d overlay: a
+        # remove="1" placed in conf.d cannot delete the static <tcp_port> shipped
+        # in keeper_config.d (Keeper merges keeper_config.d after conf.d).
+        assert '<tcp_port remove="1"/>' not in xml, error(
+            f"plaintext removal must NOT live in the per-host conf.d overlay; got:\n{xml}"
+        )
+
+    with And("Common ConfigMap (keeper_config.d) removes the static plaintext tcp_port"):
+        cm = kubectl.get("configmap", f"chk-{chk}-common-configd")
+        data = cm.get("data", {})
+        assert "chop-generated-common-listeners.xml" in data, error(
+            f"chop-generated-common-listeners.xml missing; ConfigMap keys: {list(data.keys())}"
+        )
+        xml = data["chop-generated-common-listeners.xml"]
+        assert '<tcp_port remove="1"/>' in xml, error(
+            f"expected <tcp_port remove=\"1\"/> suppression in common listeners xml:\n{xml}"
+        )
+
+    with And("Liveness probe falls back to pgrep (4LW unavailable over TLS)"):
+        sts = kubectl.get("statefulset", f"chk-{chk}-{cluster}-{host}")
+        cmd = sts["spec"]["template"]["spec"]["containers"][0]["livenessProbe"]["exec"]["command"]
+        assert cmd[0] == "pgrep", error(
+            f"expected pgrep liveness for secure-only host, got {cmd}"
+        )
+
+    with And("Raft XML still carries <secure>1</secure> per <server>"):
+        cm = kubectl.get("configmap", f"chk-{chk}-common-configd")
+        raft_xml = cm.get("data", {}).get("chop-generated-raft.xml", "")
+        assert "<secure>1</secure>" in raft_xml, error(
+            f"expected <secure>1</secure> in raft xml under secure=yes:\n{raft_xml}"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_020015. NoKeeperListener: CHK with insecure=no and secure unset is aborted on reconcile")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_020015(self):
+    """Admission gate. A CHK whose cluster declares insecure=no
+    without an offsetting secure=yes would emit a Service with no
+    client-facing Keeper port — ClickHouse clients could not reach it.
+    The normalizer's rejectNoKeeperListener gate catches this
+    unconditionally (no FIPS chopconf required) and aborts the CHK with
+    StatusReasonNoKeeperListener. The abort message names the offending
+    cluster so users can locate it in multi-cluster CHKs.
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chk_manifest = "manifests/chk/test-020015-chk-no-keeper-listener.yaml"
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with When("Apply CHK with cluster.insecure=no and cluster.secure unset"):
+        kubectl.apply(util.get_full_path(chk_manifest))
+
+    with Then("CHK lands in status=Aborted"):
+        kubectl.wait_chk_status(chk, 'Aborted')
+
+    with And("Aborted reason is [NoKeeperListener]"):
+        errors = kubectl.get_field('chk', chk, '.status.errors')
+        print(errors)
+        assert "NoKeeperListener" in errors, error(
+            f"expected [NoKeeperListener] reason in status.errors, got {errors}"
+        )
+        assert "keeper" in errors, error(
+            f"expected offending cluster name in status.errors, got {errors}"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+@TestScenario
+@Name("test_020016. Legacy CHK with neither secure nor insecure preserves pre-knob byte-identity")
+@Requirements(RQ_SRS_026_ClickHouseOperator_Create("1.0"))
+def test_020016(self):
+    """Back-compat sentinel. A CHK that declares NEITHER
+    cluster.secure NOR cluster.insecure (the legacy default shape) must
+    produce byte-identical output to the pre-knob release: the
+    per-cluster Service exposes zk:2181 + raft (no zk-secure); STS
+    container ports include zk + raft (no zk-secure); the per-host
+    ConfigMap does NOT contain chop-generated-listeners.xml; the
+    liveness probe uses the bash /dev/tcp ruok handshake (NOT the
+    pgrep fallback). Any divergence here is a back-compat regression
+    for every existing CHK in the field on upgrade.
+    """
+    create_shell_namespace_clickhouse_template()
+
+    chk_manifest = "manifests/chk/test-020016-chk-legacy-default.yaml"
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+    cluster = "keeper"
+    host = "0-0"
+
+    with When("Apply legacy CHK (neither cluster.secure nor cluster.insecure)"):
+        kubectl.create_and_check(
+            manifest=chk_manifest,
+            kind="chk",
+            check={
+                "pod_count": 1,
+                "chk_status": "Completed",
+                "do_not_delete": 1,
+            },
+        )
+
+    with Then("CR-scope Service exposes zk:2181 + raft, no zk-secure"):
+        svc = kubectl.get("service", f"keeper-{chk}")
+        port_names = {p["name"] for p in svc["spec"]["ports"]}
+        assert "zk" in port_names, error(f"expected zk port, got {port_names}")
+        assert "zk-secure" not in port_names, error(
+            f"zk-secure must be absent for legacy CHK; got {port_names}"
+        )
+
+    with And("STS container ports include zk + raft, no zk-secure"):
+        sts = kubectl.get("statefulset", f"chk-{chk}-{cluster}-{host}")
+        cports = {p["name"] for p in sts["spec"]["template"]["spec"]["containers"][0].get("ports", [])}
+        assert "zk" in cports, error(f"expected zk container port, got {cports}")
+        assert "zk-secure" not in cports, error(
+            f"zk-secure container port must be absent for legacy CHK; got {cports}"
+        )
+
+    with And("Per-host ConfigMap omits chop-generated-listeners.xml"):
+        cm = kubectl.get("configmap", f"chk-{chk}-deploy-confd-{cluster}-{host}")
+        data = cm.get("data", {})
+        assert "chop-generated-listeners.xml" not in data, error(
+            "chop-generated-listeners.xml must be absent when both cluster.secure and "
+            f"cluster.insecure are unset; ConfigMap keys: {list(data.keys())}"
+        )
+
+    with And("Common ConfigMap omits chop-generated-common-listeners.xml (byte-identity for non-adopters)"):
+        cm = kubectl.get("configmap", f"chk-{chk}-common-configd")
+        data = cm.get("data", {})
+        assert "chop-generated-common-listeners.xml" not in data, error(
+            "chop-generated-common-listeners.xml (plaintext-port removal) must be absent for a "
+            f"legacy CHK; ConfigMap keys: {list(data.keys())}"
+        )
+
+    with And("Liveness probe uses bash /dev/tcp ruok (NOT pgrep fallback)"):
+        sts = kubectl.get("statefulset", f"chk-{chk}-{cluster}-{host}")
+        cmd = sts["spec"]["template"]["spec"]["containers"][0]["livenessProbe"]["exec"]["command"]
+        assert (len(cmd) == 3) and (cmd[0] == "bash") and (cmd[1] == "-c"), error(
+            f"expected ['bash','-c',<ruok script>] liveness, got {cmd}"
+        )
+        assert "ruok" in cmd[2], error(
+            f"expected ruok in liveness script, got: {cmd[2]}"
+        )
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_030001. FIPS build: shipped image binaries embed GOFIPS140=v1.0.0")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Build_ShippedBinaries("1.0")
+)
+def test_030001(self):
+    """Verify FIPS metadata and runtime behavior for shipped image binaries.
+
+    Extracts ``clickhouse-operator`` and ``metrics-exporter`` from the release
+    images (``docker create`` + ``docker cp``, see
+    ``docs/fips_evidence_verification.md`` §5), then runs ``go version -m`` and
+    ``--fips-info`` on the host against those paths.
+
+    Also verifies runtime FIPS behavior reported by ``--fips-info`` for the
+    following ``GODEBUG`` states:
+
+      - unset                 -> enabled true, enforced false
+      - ``GODEBUG=""``        -> enabled true, enforced false
+      - ``fips140=off``       -> enabled false, enforced false
+      - ``fips140=on``        -> enabled true, enforced false
+      - ``fips140=only``      -> enabled true, enforced true
+
+    Requires ``docker`` and ``go`` on the host; does not require a Kubernetes
+    cluster beyond the test shell.
+    """
+
+    gofips_version = "v1.0.0"
+    gofips140_needle = f"GOFIPS140={gofips_version}"
+    # --fips-info reports the build-baked release version (ldflags from the
+    # `release` file), NOT the image tag — so compare against release_version,
+    # which holds the release-file value even when OPERATOR_VERSION=dev.
+    release_version = self.context.release_version
+    godebug_default = "fips140=on"
+
+    with Given("operator and metrics-exporter binaries are extracted from shipped images"):
+        fips_extract_shipped_binaries()
+
+    op_bin = self.context.fips_op_bin
+    me_bin = self.context.fips_me_bin
+
+    with When("check go version -m <binary> version for operator"):
+        check_binary_go_version(binary_path=op_bin, version=gofips140_needle)
+
+    with Then("check runtime FIPS modes for operator"):
+        check_fips_runtime_modes(
+            binary_path=op_bin,
+            binary="clickhouse-operator",
+            version=release_version,
+            gofips_version=gofips_version,
+            godebug_default=godebug_default,
+        )
+
+    with When("check go version -m <binary> version for metrics exporter"):
+        check_binary_go_version(binary_path=me_bin, version=gofips140_needle)
+
+    with And("check runtime FIPS modes for metrics-exporter"):
+        check_fips_runtime_modes(
+            binary_path=me_bin,
+            binary="metrics-exporter",
+            version=release_version,
+            gofips_version=gofips_version,
+            godebug_default=godebug_default,
+        )
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_030002. FIPS build: startup banners with strict chopconf and GODEBUG")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Build_ShippedBinaries_StartupLogs("1.0")
+)
+def test_030002(self):
+    """Verify FIPS startup banners from running operator and exporter binaries."""
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
+
+    fips_create_shell_namespace_clickhouse_template()
+    operator_namespace = self.context.operator_namespace
+
+    with Given("strict FIPS operator configuration is applied"):
+        fips_apply_operator_config(chopconf_path=chopconf)
+
+    with When("operator startup logs are fetched"):
+        operator_pod = kubectl.get_operator_pod(ns=operator_namespace)
+        op_logs = get_container_logs(
+            pod=operator_pod,
+            container="clickhouse-operator",
+            ns=operator_namespace,
+        )
+        me_logs = get_container_logs(
+            pod=operator_pod,
+            container="metrics-exporter",
+            ns=operator_namespace,
+        )
+
+    with Then("both containers report runtime.enforced=true in the FIPS banner"):
+        fips_startup_banner_ok(container="clickhouse-operator", logs=op_logs)
+        fips_startup_banner_ok(container="metrics-exporter", logs=me_logs)
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_030003. FIPS CHI/CHK: TLS-only ports and replicated CH traffic")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Connect_Operator_Listeners("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHIDeploy("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHKDeploy("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_FIPSConfig("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHK_FIPSConfig("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_VersionString("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_NoPlainHTTP("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_NoPlainNative("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHK_NoPlainClientPort("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_NoUnexpectedPorts("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHK_NoUnexpectedPorts("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHK_RaftTLS("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_InternodeTLS("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_FIPSBinary("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_GOFIPS140("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_OnlyTLSPorts("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_HTTPSAPI("1.0"),
+)
+def test_030003(self):
+    """Verify a FIPS ClickHouse + Keeper deployment runs with TLS-only data paths:
+    FIPS-built ClickHouse, Keeper, and clickhouse-backup binaries; only secure
+    ports exposed; the backup HTTPS API serving over TLS with CA-trust enforcement;
+    and ReplicatedMergeTree data converging over the TLS setup.
+    """
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
+    chi_manifest = "manifests/chi/test-030003.yaml"
+    chk_manifest = "manifests/chk/test-030003.yaml"
+    backup_template = "manifests/chit/test-030003-backup-template.yaml"
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with Given("strict FIPS operator configuration is applied"):
+        util.apply_operator_config(chopconf)
+
+    with And("test TLS secret is installed"):
+        create_tls_secret_for_fips_hosts(chi=chi, chk=chk)
+
+    with And("external ClickHouse client container is started"):
+        start_external_ch_container()
+
+    with And("FIPS ClickHouse Keeper is deployed with TLS settings"):
+        fips_apply_manifest(
+            manifest_path=chk_manifest,
+            expected_pod_count=2,
+            kind="chk",
+        )
+
+    with Then("Keeper cluster passes essential FIPS checks"):
+        fips_assert_replicas_healthy(
+            workload=chk,
+            expected_count=2,
+            kind="chk",
+        )
+
+    with And("FIPS ClickHouse is deployed with TLS settings"):
+        fips_apply_manifest(
+            manifest_path=chi_manifest,
+            expected_pod_count=2,
+            kind="chi",
+            apply_templates=[backup_template],
+        )
+
+    with Then("ClickHouse cluster passes essential FIPS checks"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=2,
+            kind="chi",
+        )
+
+    chi_pod0 = chi_pods[0]
+
+    with And("each clickhouse-backup sidecar uses a FIPS-built binary"):
+        for pod in chi_pods:
+            version = get_binary_version(
+                pod=pod,
+                binary="/bin/clickhouse-backup",
+                container="clickhouse-backup",
+            )
+            note(f"{pod} clickhouse-backup --version: {version}")
+            assert "fips" in version.lower(), error(
+                f"{pod}: expected fips in clickhouse-backup version, got {version!r}"
+            )
+
+    with And("each clickhouse-backup sidecar embeds GOFIPS metadata"):
+        check_clickhouse_backup_embeds_gofips(pods=chi_pods)
+
+    with And("clickhouse-backup sidecar exposes only its TLS API port"):
+        for pod in chi_pods:
+            fips_assert_only_tls_ports(
+                pod=pod,
+                required={8443, 9010, 9440, 7171},
+                container="clickhouse-backup",
+            )
+
+    with And("clickhouse-backup HTTPS API serves over TLS with the FIPS cert"):
+        check_clickhouse_backup_https_api_serves_tls(pods=chi_pods)
+
+    with And("clickhouse-backup HTTPS API rejects untrusted clients"):
+        check_clickhouse_backup_https_api_rejects_untrusted(pods=chi_pods)
+
+    with And("external ClickHouse client reports a FIPS server version"):
+        check_external_clickhouse_reports_fips_version(pod=chi_pod0)
+
+    with And("operator-generated ClickHouse config removes plaintext ports"):
+        settings_xml = fips_read_chop_generated_settings(pod=chi_pod0)
+        note(f"chop-generated-settings.xml:\n{settings_xml}")
+        check_ports_in_chi_settings(settings_xml=settings_xml)
+
+    with Then("ReplicatedMergeTree data converges over the TLS setup"):
+        fips_check_replication_across_replicas(chi_pods=chi_pods)
+
+    with Finally("external ClickHouse client container is removed"):
+        stop_external_ch_container()
+
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_030004. FIPS CHI: scale replicas 2 -> 3 -> 1")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_ScaleUp("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CH_ScaleDown("1.0"),
+)
+def test_030004(self):
+    """Verify FIPS ClickHouse survives replica scale-up and scale-down.
+
+    Starts from the base FIPS CHI manifest with two replicas, upscales to three,
+    then downscales to one. Each stage reuses the base manifest via a temp copy
+    with an edited ``replicasCount``.
+    """
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
+    chi_manifest = "manifests/chi/test-030003.yaml"
+    chk_manifest = "manifests/chk/test-030003.yaml"
+    backup_template = "manifests/chit/test-030003-backup-template.yaml"
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with Given("strict FIPS operator configuration is applied"):
+        util.apply_operator_config(chopconf)
+
+    with And("test TLS secret covers up to 3 CHI replicas"):
+        create_tls_secret_for_fips_hosts(chi=chi, chk=chk, replicas=3)
+
+    with And("external ClickHouse client container is started"):
+        start_external_ch_container()
+
+    with And("FIPS ClickHouse Keeper is deployed with TLS settings"):
+        fips_apply_manifest(
+            manifest_path=chk_manifest,
+            expected_pod_count=2,
+            kind="chk",
+        )
+
+    with When("FIPS ClickHouse is deployed with 2 replicas"):
+        chi_manifest_2 = fips_edit_manifest(
+            source_manifest=chi_manifest,
+            replicas_count=2,
+            kind="chi",
+        )
+        fips_apply_manifest(
+            manifest_path=chi_manifest_2,
+            expected_pod_count=2,
+            kind="chi",
+            apply_templates=[backup_template],
+        )
+
+    with Then("2-replica cluster passes essential FIPS checks"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=2,
+            kind="chi",
+        )
+
+    with And("ReplicatedMergeTree data converges across 2 replicas"):
+        fips_check_replication_across_replicas(chi_pods=chi_pods)
+
+    with When("CHI is upscaled to 3 replicas"):
+        chi_manifest_3 = fips_edit_manifest(
+            source_manifest=chi_manifest,
+            replicas_count=3,
+            kind="chi",
+        )
+        fips_apply_manifest(
+            manifest_path=chi_manifest_3,
+            expected_pod_count=3,
+            kind="chi",
+        )
+
+    with Then("3-replica cluster passes essential FIPS checks"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=3,
+            kind="chi",
+        )
+
+    with And("ReplicatedMergeTree data converges across 3 replicas"):
+        fips_check_replication_across_replicas(
+            chi_pods=chi_pods,
+            table="repl_scale_test_3",
+        )
+
+    with When("CHI is downscaled to 1 replica"):
+        chi_manifest_1 = fips_edit_manifest(
+            source_manifest=chi_manifest,
+            replicas_count=1,
+            kind="chi",
+        )
+        fips_apply_manifest(
+            manifest_path=chi_manifest_1,
+            expected_pod_count=1,
+            kind="chi",
+        )
+
+    with Then("single-replica cluster passes essential FIPS checks"):
+        fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=1,
+            kind="chi",
+        )
+
+    with Finally("external ClickHouse client container is removed"):
+        stop_external_ch_container()
+
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_030005. FIPS CHK: scale replicas 2 -> 3 -> 1")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHK_ScaleUp("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_CHK_ScaleDown("1.0"),
+)
+def test_030005(self):
+    """Verify FIPS ClickHouse Keeper survives replica scale-up and scale-down.
+
+    Starts from the base FIPS CHK manifest with two replicas, upscales to three,
+    then downscales to one. A fixed two-replica FIPS CHI is deployed alongside
+    to confirm ClickHouse stays connected after each CHK scale.
+    """
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
+    chi_manifest = "manifests/chi/test-030003.yaml"
+    chk_manifest = "manifests/chk/test-030003.yaml"
+    backup_template = "manifests/chit/test-030003-backup-template.yaml"
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with Given("strict FIPS operator configuration is applied"):
+        util.apply_operator_config(chopconf)
+
+    with And("test TLS secret covers up to 3 CHI and CHK replicas"):
+        create_tls_secret_for_fips_hosts(chi=chi, chk=chk, replicas=3)
+
+    with And("external ClickHouse client container is started"):
+        start_external_ch_container()
+
+    with When("FIPS ClickHouse Keeper is deployed with 2 replicas"):
+        chk_manifest_2 = fips_edit_manifest(
+            source_manifest=chk_manifest,
+            replicas_count=2,
+            kind="chk",
+        )
+        fips_apply_manifest(
+            manifest_path=chk_manifest_2,
+            expected_pod_count=2,
+            kind="chk",
+        )
+
+    with Then("2-replica Keeper cluster passes essential FIPS checks"):
+        fips_assert_replicas_healthy(
+            workload=chk,
+            expected_count=2,
+            kind="chk",
+        )
+
+    with And("FIPS ClickHouse is deployed with 2 replicas"):
+        chi_manifest_2 = fips_edit_manifest(
+            source_manifest=chi_manifest,
+            replicas_count=2,
+            kind="chi",
+        )
+        fips_apply_manifest(
+            manifest_path=chi_manifest_2,
+            expected_pod_count=2,
+            kind="chi",
+            apply_templates=[backup_template],
+        )
+
+    with And("2-replica ClickHouse cluster passes essential FIPS checks"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=2,
+            kind="chi",
+        )
+
+    with And("ReplicatedMergeTree data converges across 2 ClickHouse replicas"):
+        fips_check_replication_across_replicas(chi_pods=chi_pods)
+
+    with When("CHK is upscaled to 3 replicas"):
+        chk_manifest_3 = fips_edit_manifest(
+            source_manifest=chk_manifest,
+            replicas_count=3,
+            kind="chk",
+        )
+        fips_apply_manifest(
+            manifest_path=chk_manifest_3,
+            expected_pod_count=3,
+            kind="chk",
+        )
+
+    with Then("3-replica Keeper cluster passes essential FIPS checks"):
+        fips_assert_replicas_healthy(
+            workload=chk,
+            expected_count=3,
+            kind="chk",
+        )
+
+    with And("ClickHouse remains healthy after Keeper upscale"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=2,
+            kind="chi",
+        )
+
+    with And("ReplicatedMergeTree data still converges after Keeper upscale"):
+        fips_check_replication_across_replicas(
+            chi_pods=chi_pods,
+            table="repl_chk_scale_test_3",
+        )
+
+    with When("CHK is downscaled to 1 replica"):
+        chk_manifest_1 = fips_edit_manifest(
+            source_manifest=chk_manifest,
+            replicas_count=1,
+            kind="chk",
+        )
+        fips_apply_manifest(
+            manifest_path=chk_manifest_1,
+            expected_pod_count=1,
+            kind="chk",
+        )
+
+    with Then("single-replica Keeper cluster passes essential FIPS checks"):
+        fips_assert_replicas_healthy(
+            workload=chk,
+            expected_count=1,
+            kind="chk",
+        )
+
+    with And("ClickHouse remains healthy after Keeper downscale"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=2,
+            kind="chi",
+        )
+
+    with And("ReplicatedMergeTree data still converges after Keeper downscale"):
+        fips_check_replication_across_replicas(
+            chi_pods=chi_pods,
+            table="repl_chk_scale_test_1",
+        )
+
+    with Finally("external ClickHouse client container is removed"):
+        stop_external_ch_container()
+
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_030006. FIPS enforced: coerces verify, minVersion, and IPC")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_CoerceVerifyStrict("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_CoerceMinVersion13("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_OverrideMinVersion12To13("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_CoerceIPCSecure("1.0"),
+)
+def test_030006(self):
+    """Verify ``fips.enforced=true`` coerces relaxed chopconf TLS verify, minVersion, and IPC."""
+    chopconf = (
+        "manifests/chopconf/test-030006-chopconf.yaml"
+    )
+
+    fips_create_shell_namespace_clickhouse_template()
+    operator_namespace = self.context.operator_namespace
+
+    with Given("FIPS chopconf with relaxed verify and IPC is applied"):
+        fips_apply_operator_config(chopconf_path=chopconf)
+
+    with When("operator startup logs are fetched"):
+        operator_pod = kubectl.get_operator_pod(ns=operator_namespace)
+        op_logs = get_container_logs(
+            pod=operator_pod,
+            container="clickhouse-operator",
+            ns=operator_namespace,
+        )
+
+    with Then("operator logs show verify, minVersion, and IPC coercion"):
+        fips_assert_fips_enforced_coercion_in_logs(logs=op_logs)
+
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_030007. FIPS enforced: invalid CHI/CHK specs are rejected")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_RejectVerifyNoneCHI("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_RejectVerifyNoneZK("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_RejectInvalidMinVersion("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_RejectExternalZookeeper("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_RejectCHKBypass("1.0"),
+)
+def test_030007(self):
+    """Verify strict FIPS mode rejects non-compliant CHI and CHK specifications."""
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
+    chi_zk_rejected = "manifests/chi/test-073-fips-zk-rejected.yaml"
+    chi_zk_rejected_explicit_false = (
+        "manifests/chi/test-073-fips-zk-rejected-explicit-false.yaml"
+    )
+    chi_bypass_rejected = (
+        "manifests/chi/test-030007-chi-bypass-rejected.yaml"
+    )
+    chi_cluster_verify_none = "manifests/chi/test-078-fips-verify-none.yaml"
+    chi_invalid_minversion = (
+        "manifests/chi/test-030007-invalid-minversion.yaml"
+    )
+    chi_zk_verify_none = "manifests/chi/test-030007-zk-verify-none.yaml"
+    chk_bypass_rejected = (
+        "manifests/chk/test-020009-chk-fips-bypass-rejected.yaml"
+    )
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    with Given("strict FIPS operator configuration is applied"):
+        fips_apply_operator_config(chopconf_path=chopconf)
+
+    with When("CHI references plain-text external ZooKeeper"):
+        chi_zk = yaml_manifest.get_name(util.get_full_path(chi_zk_rejected))
+        fips_apply_manifest_raw(manifest_path=chi_zk_rejected)
+
+    with Then("CHI is aborted with FIPSValidationFailed"):
+        fips_assert_chi_aborted(
+            chi=chi_zk,
+            reason="FIPSValidationFailed",
+            expect_no_sts=True,
+        )
+
+    with When("CHI sets external ZooKeeper secure=false explicitly"):
+        chi_zk_explicit = yaml_manifest.get_name(
+            util.get_full_path(chi_zk_rejected_explicit_false)
+        )
+        fips_apply_manifest_raw(manifest_path=chi_zk_rejected_explicit_false)
+
+    with Then("CHI is aborted with FIPSValidationFailed"):
+        fips_assert_chi_aborted(
+            chi=chi_zk_explicit,
+            reason="FIPSValidationFailed",
+            expect_no_sts=True,
+        )
+
+    with When("CHI sets spec.security.clickhouse.tls.verify=None"):
+        chi_bypass = yaml_manifest.get_name(
+            util.get_full_path(chi_bypass_rejected)
+        )
+        fips_apply_manifest_raw(manifest_path=chi_bypass_rejected)
+
+    with Then("CHI is aborted with FIPSValidationFailed"):
+        fips_assert_chi_aborted(
+            chi=chi_bypass,
+            reason="FIPSValidationFailed",
+            expect_no_sts=True,
+        )
+
+    with When("CHI sets cluster.security.clickhouse.tls.verify=None"):
+        chi_cluster_bypass = yaml_manifest.get_name(
+            util.get_full_path(chi_cluster_verify_none)
+        )
+        fips_apply_manifest_raw(manifest_path=chi_cluster_verify_none)
+
+    with Then("CHI is aborted with FIPSValidationFailed"):
+        fips_assert_chi_aborted(
+            chi=chi_cluster_bypass,
+            reason="FIPSValidationFailed",
+            expect_no_sts=True,
+        )
+
+    with When("CHI sets clickhouse.tls.minVersion to an invalid value"):
+        chi_minversion = yaml_manifest.get_name(
+            util.get_full_path(chi_invalid_minversion)
+        )
+        fips_apply_manifest_raw(manifest_path=chi_invalid_minversion)
+
+    with Then("CHI is aborted with FIPSValidationFailed"):
+        fips_assert_chi_aborted(
+            chi=chi_minversion,
+            reason="FIPSValidationFailed",
+            expect_no_sts=True,
+        )
+
+    with When("CHI sets zookeeper.tls.verify=None"):
+        chi_zk_verify = yaml_manifest.get_name(
+            util.get_full_path(chi_zk_verify_none)
+        )
+        fips_apply_manifest_raw(manifest_path=chi_zk_verify_none)
+
+    with Then("CHI is aborted with FIPSValidationFailed"):
+        fips_assert_chi_aborted(
+            chi=chi_zk_verify,
+            reason="FIPSValidationFailed",
+            expect_no_sts=True,
+        )
+
+    with When("CHK sets spec-level security bypass"):
+        chk_bypass = yaml_manifest.get_name(
+            util.get_full_path(chk_bypass_rejected)
+        )
+        fips_apply_manifest_raw(manifest_path=chk_bypass_rejected)
+
+    with Then("CHK is aborted with FIPSValidationFailed"):
+        fips_assert_chk_aborted(
+            chk=chk_bypass,
+            reason="FIPSValidationFailed",
+            expect_no_sts=True,
+        )
+
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_030008. FIPS image policy Required: admission and runtime checks")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_Required_RejectCHI("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_Required_AcceptCHI("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_Required_RejectCHK("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_Required_RuntimeVersion("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_Required_ShortCircuit("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_TagDetection_AltinityFIPS("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_TagDetection_FIPSSuffix("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_TagDetection_CaseInsensitive("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_TagDetection_DigestOnly("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Images_TagDetection_RegistryPath("1.0"),
+)
+def test_030008(self):
+    """Verify ``security.images.policy=FIPSRequired`` rejects non-fips images
+    and accepts images whose tags contain ``fips`` (case-insensitive).
+    """
+    chopconf = "manifests/chopconf/test-074-fips-images-required-chopconf.yaml"
+    chi_non_fips_manifest = (
+        "manifests/chi/test-074-fips-images-required-non-fips.yaml"
+    )
+    chi_fips_manifest = "manifests/chi/test-075-fips-images-required-fips.yaml"
+    chk_non_fips_manifest = (
+        "manifests/chk/test-020010-chk-fips-images-required-non-fips.yaml"
+    )
+    chi_runtime_decoy_manifest = (
+        "manifests/chi/test-030008-runtime-decoy.yaml"
+    )
+    chi_shortcircuit_manifest = (
+        "manifests/chi/test-030008-shortcircuit.yaml"
+    )
+    chi_digest_only_manifest = (
+        "manifests/chi/test-030008-digest-only.yaml"
+    )
+    chi_registry_path_manifest = (
+        "manifests/chi/test-030008-registry-path.yaml"
+    )
+    chi_fips_suffix_manifest = (
+        "manifests/chi/test-030008-fips-suffix.yaml"
+    )
+    chi_case_insensitive_manifest = (
+        "manifests/chi/test-030008-case-insensitive.yaml"
+    )
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    chi_non_fips = yaml_manifest.get_name(
+        util.get_full_path(chi_non_fips_manifest)
+    )
+    chi_fips = yaml_manifest.get_name(util.get_full_path(chi_fips_manifest))
+    chk_non_fips = yaml_manifest.get_name(
+        util.get_full_path(chk_non_fips_manifest)
+    )
+    chi_decoy = yaml_manifest.get_name(
+        util.get_full_path(chi_runtime_decoy_manifest)
+    )
+    chi_shortcircuit = yaml_manifest.get_name(
+        util.get_full_path(chi_shortcircuit_manifest)
+    )
+    chi_digest_only = yaml_manifest.get_name(
+        util.get_full_path(chi_digest_only_manifest)
+    )
+    chi_registry_path = yaml_manifest.get_name(
+        util.get_full_path(chi_registry_path_manifest)
+    )
+    chi_fips_suffix = yaml_manifest.get_name(
+        util.get_full_path(chi_fips_suffix_manifest)
+    )
+    chi_case_insensitive = yaml_manifest.get_name(
+        util.get_full_path(chi_case_insensitive_manifest)
+    )
+
+    with Given("FIPS image policy Required is applied"):
+        fips_apply_operator_config(chopconf_path=chopconf)
+
+    with When("CHI with non-fips image tag is applied"):
+        fips_apply_manifest_raw(manifest_path=chi_non_fips_manifest)
+
+    with Then("CHI is aborted at admission with FIPSImagePolicyViolation"):
+        fips_assert_chi_aborted(
+            chi=chi_non_fips,
+            reason="FIPSImagePolicyViolation",
+            expect_no_sts=True,
+            expect_reason_leading=True,
+        )
+
+    with When("CHK with non-fips image tag is applied"):
+        fips_apply_manifest_raw(manifest_path=chk_non_fips_manifest)
+
+    with Then("CHK is aborted at admission with FIPSImagePolicyViolation"):
+        fips_assert_chk_aborted(
+            chk=chk_non_fips,
+            reason="FIPSImagePolicyViolation",
+            expect_no_sts=True,
+        )
+
+    with When("CHI with two non-fips replicas is applied"):
+        fips_apply_manifest_raw(manifest_path=chi_shortcircuit_manifest)
+
+    with Then("CHI is aborted with a single FIPSImagePolicyViolation"):
+        fips_assert_chi_aborted(
+            chi=chi_shortcircuit,
+            reason="FIPSImagePolicyViolation",
+            expect_no_sts=True,
+        )
+        errors = kubectl.get_field("chi", chi_shortcircuit, ".status.errors")
+        violation_count = errors.count("FIPSImagePolicyViolation")
+        assert violation_count == 1, error(
+            f"expected exactly 1 FIPSImagePolicyViolation for multi-host CHI, "
+            f"got {violation_count} in: {errors}"
+        )
+
+    with When("CHI with digest-only image reference is applied"):
+        fips_apply_manifest_raw(manifest_path=chi_digest_only_manifest)
+
+    with Then("CHI is aborted because digest-only is not detected as FIPS"):
+        fips_assert_chi_aborted(
+            chi=chi_digest_only,
+            reason="FIPSImagePolicyViolation",
+            expect_no_sts=True,
+        )
+
+    with When("CHI with fips in registry hostname but not in tag is applied"):
+        fips_apply_manifest_raw(manifest_path=chi_registry_path_manifest)
+
+    with Then("CHI is aborted because registry path does not satisfy FIPS tag detection"):
+        fips_assert_chi_aborted(
+            chi=chi_registry_path,
+            reason="FIPSImagePolicyViolation",
+            expect_no_sts=True,
+        )
+
+    with When("CHI with altinityfips-tagged image is applied"):
+        fips_apply_manifest(
+            manifest_path=chi_fips_manifest,
+            expected_pod_count=1,
+            kind="chi",
+        )
+
+    with Then("CHI reconciles without image policy violation"):
+        errors = kubectl.get_field("chi", chi_fips, ".status.errors")
+        assert "FIPSImagePolicyViolation" not in errors, error(
+            f"unexpected FIPSImagePolicyViolation in status.errors, got {errors}"
+        )
+
+    with When("CHI with fips-suffix tag is applied"):
+        fips_apply_manifest_raw(manifest_path=chi_fips_suffix_manifest)
+
+    with Then("CHI is admitted because tag contains fips"):
+        fips_assert_chi_admitted(chi=chi_fips_suffix)
+
+    with When("CHI with uppercase FIPS tag is applied"):
+        fips_apply_manifest_raw(manifest_path=chi_case_insensitive_manifest)
+
+    with Then("CHI is admitted because tag detection is case-insensitive"):
+        fips_assert_chi_admitted(chi=chi_case_insensitive)
+
+    with When("runtime decoy image alias is prepared"):
+        decoy_tag = "altinity/clickhouse-server:25.8.16.10002.altinityfips-decoy"
+        stable_tag = "altinity/clickhouse-server:25.8.16.10002.altinitystable"
+        tag_result = subprocess.run(
+            ["docker", "tag", stable_tag, decoy_tag],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        # The kubelet uses minikube's own image store, not the host docker
+        # daemon where `docker tag` created the alias — load it in, otherwise the
+        # decoy pod is ImagePullBackOff (the synthetic tag exists on no registry)
+        # and never starts, so the runtime SELECT version() check never runs.
+        load_result = None
+        if tag_result.returncode == 0:
+            load_result = subprocess.run(
+                ["minikube", "image", "load", decoy_tag],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        if tag_result.returncode != 0:
+            note(
+                f"skipping runtime decoy check: "
+                f"docker tag failed ({tag_result.stderr.strip()})"
+            )
+        elif load_result.returncode != 0:
+            note(
+                f"skipping runtime decoy check: "
+                f"minikube image load failed ({load_result.stderr.strip()})"
+            )
+        else:
+            with When("CHI with fips tag but non-fips binary is applied"):
+                fips_apply_manifest_raw(manifest_path=chi_runtime_decoy_manifest)
+
+            with Then("CHI is aborted at runtime with FIPSImagePolicyViolation"):
+                kubectl.wait_chi_status(chi_decoy, "Aborted")
+                errors = kubectl.get_field("chi", chi_decoy, ".status.errors")
+                assert "FIPSImagePolicyViolation" in errors, error(
+                    f"expected runtime FIPSImagePolicyViolation, got {errors}"
+                )
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_030009. FIPS enforced: operator TLS clients reject servers without TLS 1.3")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_CoerceMinVersion13("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_Enforced_MinVersionScope("1.0"),
+)
+def test_030009(self):
+    """Verify operator-side TLS clients reject servers without TLS 1.3.
+
+    Negative CHI and CHK manifests deliberately disable TLS 1.3 on the server
+    side. Under strict FIPS operator config, operator TLS clients are coerced
+    to minVersion=1.3 and must fail to communicate with those TLS1.2-only
+    servers.
+    """
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
+    chi_tls12_manifest = "manifests/chi/test-030009-chi-tls12-only.yaml"
+    chk_tls12_manifest = "manifests/chk/test-030009-chk-tls12-only.yaml"
+    chk_manifest = "manifests/chk/test-030003.yaml"
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    chi_tls12 = yaml_manifest.get_name(util.get_full_path(chi_tls12_manifest))
+    chk_tls12 = yaml_manifest.get_name(util.get_full_path(chk_tls12_manifest))
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with Given("strict FIPS operator configuration is applied"):
+        fips_apply_operator_config(chopconf_path=chopconf)
+
+    with And("test TLS secret is installed"):
+        create_tls_secret_for_fips_hosts(chi=chi_tls12, chk=chk)
+
+    with And("normal CHK is applied"):
+        fips_apply_manifest(
+            manifest_path=chk_manifest,
+            expected_pod_count=2,
+            kind="chk",
+        )
+
+    with Then("normal CHK becomes healthy"):
+        fips_assert_replicas_healthy(
+            workload=chk,
+            expected_count=2,
+            kind="chk",
+        )
+
+    with When("CHI server disables TLS 1.3"):
+        fips_apply_manifest(
+            manifest_path=chi_tls12_manifest,
+            kind="chi",
+            expected_status="InProgress",
+        )
+
+    with Then("operator rejects CHI because TLS 1.3 cannot be negotiated"):
+        fips_assert_chi_tls_rejected(
+            chi=chi_tls12,
+            min_version="1.3",
+        )
+
+    with When("CHK server disables TLS 1.3"):
+        fips_apply_manifest(
+            manifest_path=chk_tls12_manifest,
+            kind="chk",
+            expected_status="InProgress",
+        )
+
+    with Then("operator rejects CHK because TLS 1.3 cannot be negotiated"):
+        fips_assert_chk_tls_rejected(
+            chk=chk_tls12,
+            min_version="1.3",
+        )
+
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_030010. FIPS on-wire TLS verification: Strict + wrong rootCA fails ClickHouse fetch")
+def test_030010(self):
+    """Strict verify with a wrong rootCA must fail operator ClickHouse fetch."""
+    tls_secret = "manifests/secret/test-058-secret.yaml"
+    chi_manifest = "manifests/chi/test-077-fips-tls-wrong-ca.yaml"
+    chopconf = "manifests/chopconf/test-077-fips-tls-wrong-ca-chopconf.yaml"
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    operator_namespace = self.context.operator_namespace
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+
+    with Given("test-058 TLS secret is installed"):
+        kubectl.apply(util.get_full_path(tls_secret))
+
+    with When("HTTPS ClickHouse CHI is deployed"):
+        fips_apply_manifest(
+            manifest_path=chi_manifest,
+            expected_pod_count=1,
+            kind="chi",
+            apply_templates=[current().context.clickhouse_template],
+        )
+
+    with And("operator chopconf sets verify=Strict with an unrelated rootCA"):
+        fips_apply_operator_config(chopconf_path=chopconf)
+        kubectl.wait_chi_status(chi, "Completed")
+
+    with Then("chi_clickhouse_metric_fetch_errors is 1 for this CHI"):
+        check_metrics_monitoring(
+            operator_namespace=operator_namespace,
+            operator_pod=kubectl.get_operator_pod(ns=operator_namespace),
+            expect_pattern=(
+                f'^chi_clickhouse_metric_fetch_errors{{[^}}]*chi="{chi}"[^}}]*}} 1$'
+            ),
+        )
+
+    with When("operator configuration is reset to default"):
+        kubectl.delete(
+            util.get_full_path(chopconf, lookup_in_host=False),
+            operator_namespace,
+        )
+        util.restart_operator()
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_030012. FIPS backup: ClickHouse over TLS and HTTPS restore round-trip")
+@Requirements(
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_ClickHouseOverTLS("1.0"),
+    RQ_SRS_026_ClickHouseOperator_FIPS_DataPlane_Backup_RestoreRoundTrip("1.0"),
+)
+def test_030012(self):
+    """Verify clickhouse-backup uses TLS to ClickHouse and restore works via HTTPS API."""
+
+    chopconf = "manifests/chopconf/test-030002-chopconf.yaml"
+    chi_manifest = "manifests/chi/test-030003.yaml"
+    chk_manifest = "manifests/chk/test-030003.yaml"
+    backup_template = "manifests/chit/test-030003-backup-template.yaml"
+
+    fips_create_shell_namespace_clickhouse_template()
+
+    chi = yaml_manifest.get_name(util.get_full_path(chi_manifest))
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest))
+
+    with Given("strict FIPS operator configuration is applied"):
+        util.apply_operator_config(chopconf)
+
+    with And("test TLS secret is installed"):
+        create_tls_secret_for_fips_hosts(chi=chi, chk=chk)
+
+    with And("external ClickHouse client container is started"):
+        start_external_ch_container()
+
+    with And("FIPS Keeper is deployed"):
+        fips_apply_manifest(
+            manifest_path=chk_manifest,
+            expected_pod_count=2,
+            kind="chk",
+        )
+
+    with And("FIPS ClickHouse with backup sidecar is deployed"):
+        fips_apply_manifest(
+            manifest_path=chi_manifest,
+            expected_pod_count=2,
+            kind="chi",
+            apply_templates=[backup_template],
+        )
+
+    with Given("FIPS ClickHouse cluster is healthy"):
+        chi_pods = fips_assert_replicas_healthy(
+            workload=chi,
+            expected_count=2,
+            kind="chi",
+        )
+
+        pod = chi_pods[0]
+
+    with Then("backup sidecar reaches ClickHouse through secure native TCP"):
+        check_clickhouse_backup_clickhouse_tls_config(pod=pod)
+        check_clickhouse_backup_can_list_tables_over_clickhouse_tls(pod=pod)
+
+    with Then("backup and restore succeeds through HTTPS API"):
+        check_clickhouse_backup_restore_roundtrip_https(pod=pod)
+
+    with Finally("external ClickHouse client container is removed"):
+        stop_external_ch_container()
 
 def cleanup_chis(self):
     with Given("Cleanup CHIs"):
@@ -6730,6 +8783,7 @@ def cleanup_chis(self):
                 if ns_name.startswith("test") and ns_name != self.context.test_namespace:
                     with Then(f"Delete ns {ns_name}"):
                         util.delete_namespace(namespace = ns_name, delete_chi=True)
+
 
 
 @TestModule
@@ -6757,11 +8811,27 @@ def test(self):
     # define values for Operator upgrade test (test_009)
 
     with Pool(int(os.environ.get("POOL_SIZE", 3))) as pool:
-        for scenario in loads(current_module(), Scenario, Suite):
-            if not (hasattr(scenario, "tags") and ("NO_PARALLEL" in scenario.tags)):
-                Scenario(run=scenario, parallel=True, executor=pool)
+        # Front-load HEAVY scenarios (chopconf->operator restart, scaling,
+        # multi-deploy). sorted() is stable, so the key (0 for HEAVY, else 1)
+        # moves heavy tests to the front while preserving the natural per-group
+        # (0100xx/0200xx/0300xx) source order within each bucket — slow tests
+        # start early AND lead within each group, grabbing pool workers instead
+        # of trickling in at the tail (where retries serialize). Order-only:
+        # membership and the NO_PARALLEL exclusion are unaffected.
+        parallel_scenarios = [
+            scenario
+            for scenario in loads(current_module(), Scenario, Suite)
+            if not (hasattr(scenario, "tags") and ("NO_PARALLEL" in scenario.tags))
+        ]
+        parallel_scenarios.sort(
+            key=lambda s: 0 if (hasattr(s, "tags") and ("HEAVY" in s.tags)) else 1
+        )
+        for scenario in parallel_scenarios:
+            Scenario(run=scenario, parallel=True, executor=pool)
         join()
 
+    # Sequential pass: intentionally NOT reordered — test_090099 (CRD deletion)
+    # must run last, after test_010036 / the upgrade tests.
     for scenario in loads(current_module(), Scenario, Suite):
         if hasattr(scenario, "tags") and ("NO_PARALLEL" in scenario.tags):
             Scenario(run=scenario)

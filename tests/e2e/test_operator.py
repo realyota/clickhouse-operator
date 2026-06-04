@@ -7169,6 +7169,7 @@ def test_020002(self):
 
 @TestScenario
 @Name("test_020003. Clickhouse-keeper upgrade")
+@Tags("HEAVY")
 def test_020003(self):
     """Check that clickhouse-operator support upgrading clickhouse-keeper version
      when clickhouse-keeper defined with ClickHouseKeeperInstallation."""

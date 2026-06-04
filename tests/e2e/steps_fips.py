@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -509,24 +510,25 @@ def create_tls_secret_for_fips_hosts(
 # ---------------------------------------------------------------------------
 
 @TestStep(Given)
-def start_external_ch_container(self, ns=None):
-    """Start a long-lived Docker container for external TLS ClickHouse queries.
-
-    Requires ``create_tls_secret_for_fips_hosts`` to have run first
-    (``context.tls``).
-    """
+def start_external_ch_container(self, ns=None, cipher_suites=None):
     ns = ns or self.context.test_namespace
     ca_crt = self.context.tls["ca_crt"]
     container = f"fips-ch-ext-{ns}"[:63]
     fips_image = "altinity/clickhouse-server:25.3.8.30001.altinityfips"
 
-    openssl_xml = """
+    cipher_suites_xml = ""
+    if cipher_suites:
+        cipher_suites_xml = (
+            f"\n      <cipherSuites>{':'.join(cipher_suites)}</cipherSuites>"
+        )
+
+    openssl_xml = f"""
 <clickhouse>
   <openSSL>
     <client>
       <caConfig>/tmp/ca.crt</caConfig>
       <loadDefaultCAFile>false</loadDefaultCAFile>
-      <verificationMode>strict</verificationMode>
+      <verificationMode>strict</verificationMode>{cipher_suites_xml}
     </client>
   </openSSL>
 </clickhouse>
@@ -565,6 +567,7 @@ def start_external_ch_container(self, ns=None):
         f"stdout:\n{result.stdout}\n"
         f"stderr:\n{result.stderr}"
     )
+
     note(f"external ClickHouse client container started: {container}")
     self.context.external_chi_container = container
 
@@ -1306,3 +1309,213 @@ def fips_wait_table_removed_from_dropped_tables(
     assert False, error(
         f"{database}.{table} still present in system.dropped_tables after {timeout}s"
     )
+@TestStep(Given)
+def fips_edit_cipher_suites_manifest(
+    self,
+    source_manifest,
+    cipher_suites,
+):
+    """Load CHI/CHK manifest, patch OpenSSL cipherSuites, write temp copy."""
+
+    source_path = util.get_full_path(source_manifest)
+    cipher_suites_value = ":".join(cipher_suites)
+
+    with open(source_path, encoding="utf-8") as f:
+        manifest = yaml.safe_load(f)
+
+    files = (
+        manifest
+        .setdefault("spec", {})
+        .setdefault("configuration", {})
+        .setdefault("files", {})
+    )
+
+    openssl_xml = files["openssl.xml"]
+
+    openssl_xml = re.sub(
+        r"<cipherSuites>.*?</cipherSuites>",
+        f"<cipherSuites>{cipher_suites_value}</cipherSuites>",
+        openssl_xml,
+        flags=re.DOTALL,
+    )
+
+    files["openssl.xml"] = openssl_xml
+
+    fd, temp_path = tempfile.mkstemp(
+        suffix=".yaml",
+        prefix="fips-cipher-update-",
+    )
+    os.close(fd)
+
+    with open(temp_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            manifest,
+            f,
+            default_flow_style=False,
+            sort_keys=False,
+        )
+
+    note(f"edited cipher-suite manifest written to {temp_path}")
+    note(f"cipherSuites={cipher_suites_value}")
+
+    return temp_path
+
+@TestStep(Then)
+def fips_assert_chi_cipher_suites_configured(
+    self,
+    pod,
+    cipher_suites,
+):
+    """Assert ClickHouse generated OpenSSL config contains the expected cipherSuites."""
+
+    expected = ":".join(cipher_suites)
+
+    openssl_xml = kubectl.launch(
+        f"exec {pod} -c clickhouse -- "
+        "cat /etc/clickhouse-server/config.d/openssl.xml"
+    )
+
+    expected_line = f"<cipherSuites>{expected}</cipherSuites>"
+
+    assert expected_line in openssl_xml, error(
+        f"{pod}: expected cipherSuites not found\n"
+        f"expected: {expected_line}\n"
+        f"openssl.xml:\n{openssl_xml}"
+    )
+
+
+@TestStep(Then)
+def fips_assert_clickhouse_https_cipher_suite_accepted(
+    self,
+    pod,
+    cipher_suite,
+):
+    """Assert ClickHouse HTTPS accepts the configured TLS 1.3 cipher suite."""
+
+    output = fips_run_openssl_s_client_for_clickhouse_https(
+        pod=pod,
+        cipher_suite=cipher_suite,
+        ok_to_fail=False,
+    )
+
+    assert f"Cipher is {cipher_suite}" in output, error(
+        f"{pod}: expected negotiated cipher {cipher_suite}\n"
+        f"output:\n{output}"
+    )
+
+    assert "Protocol  : TLSv1.3" in output or "Protocol: TLSv1.3" in output, error(
+        f"{pod}: expected TLSv1.3 negotiation\n"
+        f"output:\n{output}"
+    )
+
+
+@TestStep(Then)
+def fips_assert_clickhouse_https_cipher_suite_rejected(
+    self,
+    pod,
+    cipher_suite,
+):
+    """Assert ClickHouse HTTPS rejects a TLS 1.3 cipher suite not present in config."""
+
+    output = fips_run_openssl_s_client_for_clickhouse_https(
+        pod=pod,
+        cipher_suite=cipher_suite,
+        ok_to_fail=True,
+    )
+
+    assert f"Cipher is {cipher_suite}" not in output, error(
+        f"{pod}: unexpected negotiated cipher {cipher_suite}\n"
+        f"output:\n{output}"
+    )
+
+
+@TestStep(When)
+def fips_run_openssl_s_client_for_clickhouse_https(
+    self,
+    pod,
+    cipher_suite,
+    ok_to_fail=False,
+):
+    """Run openssl s_client against ClickHouse HTTPS through kubectl port-forward."""
+
+    ns = self.context.test_namespace
+    ca_crt = self.context.tls["ca_crt"]
+    local_port = "8443"
+
+    pf = subprocess.Popen(
+        [
+            "kubectl",
+            "-n",
+            ns,
+            "port-forward",
+            f"pod/{pod}",
+            f"{local_port}:8443",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if pf.poll() is not None:
+                out, err = pf.communicate()
+                assert False, error(
+                    "kubectl port-forward exited early\n"
+                    f"stdout:\n{out}\n"
+                    f"stderr:\n{err}"
+                )
+
+            try:
+                socket.create_connection(
+                    ("127.0.0.1", int(local_port)),
+                    timeout=0.5,
+                ).close()
+                break
+            except OSError:
+                time.sleep(0.2)
+        else:
+            assert False, error(
+                f"kubectl port-forward to {pod}:8443 "
+                f"did not become ready on 127.0.0.1:{local_port}"
+            )
+
+        result = subprocess.run(
+            [
+                "openssl",
+                "s_client",
+                "-connect",
+                f"127.0.0.1:{local_port}",
+                "-servername",
+                "localhost",
+                "-tls1_3",
+                "-ciphersuites",
+                cipher_suite,
+                "-CAfile",
+                ca_crt,
+                "-verify_return_error",
+            ],
+            input="Q\n",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        output = f"{result.stdout}\n{result.stderr}"
+
+        if not ok_to_fail:
+            assert result.returncode == 0, error(
+                f"{pod}: openssl s_client failed for {cipher_suite}\n"
+                f"exit code: {result.returncode}\n"
+                f"output:\n{output}"
+            )
+
+        return output
+
+    finally:
+        pf.terminate()
+        try:
+            pf.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pf.kill()

@@ -1440,11 +1440,17 @@ def fips_run_openssl_s_client_for_clickhouse_https(
 
     ns = self.context.test_namespace
     ca_crt = self.context.tls["ca_crt"]
-    local_port = "8443"
+
+    # Bind an ephemeral local port so concurrent scenarios never collide on a
+    # fixed forward port (keeps this step parallel-safe). Use the suite-configured
+    # kubectl command rather than a hardcoded "kubectl".
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _probe:
+        _probe.bind(("127.0.0.1", 0))
+        local_port = str(_probe.getsockname()[1])
 
     pf = subprocess.Popen(
-        [
-            "kubectl",
+        self.context.kubectl_cmd.split()
+        + [
             "-n",
             ns,
             "port-forward",
